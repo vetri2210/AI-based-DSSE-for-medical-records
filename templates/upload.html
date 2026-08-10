@@ -2,18 +2,17 @@
 {% block content %}
 <div class="row justify-content-center">
   <div class="col-lg-7">
-    <div class="card shadow-sm">
-      <div class="card-body">
-        <h3 class="card-title mb-3">Upload Document</h3>
-        <p class="text-muted">Upload PDF, DOCX, or TXT files. The system extracts text, generates keywords, and encrypts the file.</p>
-        <form method="post" enctype="multipart/form-data">
-          <div class="mb-3">
-            <label class="form-label">Choose document</label>
-            <input class="form-control" type="file" name="document" required />
-          </div>
-          <button class="btn btn-primary" type="submit">Upload & Encrypt</button>
-        </form>
-      </div>
+    <div class="panel-card p-4 p-lg-5">
+      <span class="stat-chip mb-3">Upload & encrypt</span>
+      <h3 class="page-title mb-2">Secure a new document</h3>
+      <p class="page-subtitle">Upload PDF, DOCX, or TXT files. The system extracts text, generates keywords, and encrypts the file for safekeeping.</p>
+      <form method="post" enctype="multipart/form-data">
+        <div class="mb-3">
+          <label class="form-label">Choose document</label>
+          <input class="form-control" type="file" name="document" required />
+        </div>
+        <button class="btn btn-primary" type="submit">Upload & Encrypt</button>
+      </form>
     </div>
   </div>
 </div>

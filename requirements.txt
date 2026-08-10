@@ -1,0 +1,6 @@
+Flask>=2.0
+PyPDF2>=3.0
+python-docx>=0.8
+nltk>=3.8
+scikit-learn>=1.0
+pycryptodome>=3.18

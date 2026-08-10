@@ -1,0 +1,40 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card shadow-sm">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h3 class="card-title">Uploaded Documents</h3>
+      <a class="btn btn-primary" href="{{ url_for('upload') }}">Upload New</a>
+    </div>
+    {% if documents %}
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Filename</th>
+            <th>Uploaded</th>
+            <th>Owner</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for doc in documents %}
+          <tr>
+            <td>{{ doc.filename }}</td>
+            <td>{{ doc.upload_date }}</td>
+            <td>{{ doc.owner }}</td>
+            <td>
+              <a class="btn btn-sm btn-outline-primary" href="{{ url_for('document_detail', document_id=doc.id) }}">Details</a>
+              <a class="btn btn-sm btn-outline-success" href="{{ url_for('decrypt', document_id=doc.id) }}">Decrypt</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="alert alert-info">No documents found yet.</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

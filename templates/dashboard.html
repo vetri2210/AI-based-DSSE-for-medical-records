@@ -1,0 +1,46 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card shadow-sm">
+  <div class="card-body">
+    <h2 class="card-title">Welcome, {{ session.username }}!</h2>
+    <p class="lead">Your secure document dashboard is ready. Upload a file and view your encrypted documents.</p>
+    <div class="row g-3 mb-4">
+      <div class="col-sm-6">
+        <a class="btn btn-primary w-100" href="{{ url_for('upload') }}">Upload Document</a>
+      </div>
+      <div class="col-sm-6">
+        <a class="btn btn-outline-secondary w-100" href="{{ url_for('documents') }}">View Uploaded Documents</a>
+      </div>
+    </div>
+
+    <h5 class="mt-4">Recent Documents</h5>
+    {% if documents %}
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Filename</th>
+            <th>Uploaded</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for doc in documents[:5] %}
+          <tr>
+            <td>{{ doc.filename }}</td>
+            <td>{{ doc.upload_date }}</td>
+            <td>
+              <a class="btn btn-sm btn-outline-primary" href="{{ url_for('document_detail', document_id=doc.id) }}">Details</a>
+              <a class="btn btn-sm btn-outline-success" href="{{ url_for('decrypt', document_id=doc.id) }}">Decrypt</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="alert alert-info">No documents uploaded yet. Start with Upload Document.</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

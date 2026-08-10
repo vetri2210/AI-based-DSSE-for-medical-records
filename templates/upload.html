@@ -1,0 +1,20 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-7">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h3 class="card-title mb-3">Upload Document</h3>
+        <p class="text-muted">Upload PDF, DOCX, or TXT files. The system extracts text, generates keywords, and encrypts the file.</p>
+        <form method="post" enctype="multipart/form-data">
+          <div class="mb-3">
+            <label class="form-label">Choose document</label>
+            <input class="form-control" type="file" name="document" required />
+          </div>
+          <button class="btn btn-primary" type="submit">Upload & Encrypt</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

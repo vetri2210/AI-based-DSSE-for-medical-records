@@ -1,0 +1,93 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="card shadow-sm mb-4">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h3 class="card-title mb-0">🔍 Search Results</h3>
+      <a class="btn btn-outline-secondary" href="{{ url_for('search') }}">New Search</a>
+    </div>
+    
+    <div class="bg-light rounded p-3 mb-3">
+      <small class="text-muted">Search Query</small>
+      <p class="mb-0 h5"><code>{{ query }}</code></p>
+    </div>
+    
+    <div class="row g-3 mb-3">
+      <div class="col-md-4">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">Search Type</div>
+          <div class="h5 mb-0">
+            {% if search_type == 'conjunctive' %}
+              <span class="badge bg-primary">Conjunctive AND</span>
+            {% else %}
+              <span class="badge bg-secondary">Single Keyword</span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      <div class="col-md-4">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">Keywords</div>
+          <div class="h5 mb-0">{{ keywords|length }}</div>
+        </div>
+      </div>
+      <div class="col-md-4">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">Search Time</div>
+          <div class="h5 mb-0">{{ search_time_ms }} ms</div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="mb-3">
+      <h5>Keywords Searched</h5>
+      <div class="d-flex flex-wrap gap-2">
+        {% for kw in keywords %}
+          <span class="badge bg-info">{{ kw }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card shadow-sm">
+  <div class="card-body">
+    <h5 class="card-title">Results Found: <strong>{{ result_count }}</strong></h5>
+    
+    {% if results %}
+      <div class="list-group">
+        {% for result in results %}
+          <div class="list-group-item list-group-item-action">
+            <div class="d-flex justify-content-between align-items-start">
+              <div class="flex-grow-1">
+                <h6 class="mb-1">{{ result.filename }}</h6>
+                <small class="text-muted">Uploaded: {{ result.upload_date }}</small>
+                
+                {% if result.matched_keywords %}
+                  <div class="mt-2">
+                    <small class="text-muted d-block mb-1">Matched Keywords:</small>
+                    <div class="d-flex flex-wrap gap-1">
+                      {% for kw in result.matched_keywords %}
+                        <span class="badge bg-success">{{ kw }}</span>
+                      {% endfor %}
+                    </div>
+                  </div>
+                {% endif %}
+              </div>
+              
+              <div class="btn-group ms-2" role="group">
+                <a class="btn btn-sm btn-outline-primary" href="{{ url_for('document_detail', document_id=result.id) }}">View</a>
+                <a class="btn btn-sm btn-outline-success" href="{{ url_for('decrypt', document_id=result.id) }}">Decrypt</a>
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="alert alert-info">
+        <strong>No results found.</strong> Try a different search query or check that documents have been indexed.
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

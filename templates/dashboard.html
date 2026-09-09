@@ -1,15 +1,50 @@
 {% extends "layout.html" %}
 {% block content %}
-<div class="card shadow-sm">
+<div class="card shadow-sm mb-4">
   <div class="card-body">
     <h2 class="card-title">Welcome, {{ session.username }}!</h2>
-    <p class="lead">Your secure document dashboard is ready. Upload a file and view your encrypted documents.</p>
+    <p class="lead">Your secure medical records dashboard with searchable encryption enabled.</p>
+    
+    <!-- Quick Stats -->
+    {% if cube_stats %}
     <div class="row g-3 mb-4">
-      <div class="col-sm-6">
-        <a class="btn btn-primary w-100" href="{{ url_for('upload') }}">Upload Document</a>
+      <div class="col-md-3">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">Total Documents</div>
+          <div class="h4 mb-0">{{ cube_stats.get('total_documents', 0) }}</div>
+        </div>
       </div>
-      <div class="col-sm-6">
-        <a class="btn btn-outline-secondary w-100" href="{{ url_for('documents') }}">View Uploaded Documents</a>
+      <div class="col-md-3">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">Indexed Documents</div>
+          <div class="h4 mb-0">{{ cube_stats.get('indexed_documents', 0) }}</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">Total Keywords</div>
+          <div class="h4 mb-0">{{ cube_stats.get('total_keywords', 0) }}</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="text-center p-3 border rounded">
+          <div class="text-muted small">CUBE Entries</div>
+          <div class="h4 mb-0">{{ cube_stats.get('hki_entries', 0) }}</div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+    
+    <!-- Action Buttons -->
+    <div class="row g-3 mb-4">
+      <div class="col-sm-4">
+        <a class="btn btn-primary w-100" href="{{ url_for('upload') }}">📤 Upload Document</a>
+      </div>
+      <div class="col-sm-4">
+        <a class="btn btn-info w-100" href="{{ url_for('search') }}">🔍 Search Documents</a>
+      </div>
+      <div class="col-sm-4">
+        <a class="btn btn-warning w-100" href="{{ url_for('cube_dashboard') }}">📊 View CUBE Index</a>
       </div>
     </div>
 
@@ -30,8 +65,13 @@
             <td>{{ doc.filename }}</td>
             <td>{{ doc.upload_date }}</td>
             <td>
-              <a class="btn btn-sm btn-outline-primary" href="{{ url_for('document_detail', document_id=doc.id) }}">Details</a>
-              <a class="btn btn-sm btn-outline-success" href="{{ url_for('decrypt', document_id=doc.id) }}">Decrypt</a>
+              <div class="btn-group btn-group-sm" role="group">
+                <a class="btn btn-outline-primary" href="{{ url_for('document_detail', document_id=doc.id) }}">View</a>
+                <a class="btn btn-outline-success" href="{{ url_for('decrypt', document_id=doc.id) }}">Decrypt</a>
+                <form method="POST" action="{{ url_for('delete_document', document_id=doc.id) }}" style="display: inline;">
+                  <button class="btn btn-outline-danger" type="submit" onclick="return confirm('Delete this document?')">Delete</button>
+                </form>
+              </div>
             </td>
           </tr>
           {% endfor %}
@@ -39,7 +79,7 @@
       </table>
     </div>
     {% else %}
-    <div class="alert alert-info">No documents uploaded yet. Start with Upload Document.</div>
+    <div class="alert alert-info">No documents uploaded yet. Start by uploading a medical document.</div>
     {% endif %}
   </div>
 </div>

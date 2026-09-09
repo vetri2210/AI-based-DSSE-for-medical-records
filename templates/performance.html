@@ -1,0 +1,127 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2 class="mb-4">⚡ Performance Dashboard</h2>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">Encryption Operations</div>
+        <div class="h4 mb-1">{{ perf_summary.get('encryption', {}).get('count', 0) }}</div>
+        <small class="text-muted">
+          Avg: {{ "%.2f"|format(perf_summary.get('encryption', {}).get('avg_ms', 0)) }} ms
+        </small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">Search Operations</div>
+        <div class="h4 mb-1">{{ perf_summary.get('search', {}).get('count', 0) }}</div>
+        <small class="text-muted">
+          Avg: {{ "%.2f"|format(perf_summary.get('search', {}).get('avg_ms', 0)) }} ms
+        </small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">CUBE Updates</div>
+        <div class="h4 mb-1">{{ perf_summary.get('cube_update', {}).get('count', 0) }}</div>
+        <small class="text-muted">
+          Avg: {{ "%.2f"|format(perf_summary.get('cube_update', {}).get('avg_ms', 0)) }} ms
+        </small>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <h5 class="mb-0">Encryption Performance</h5>
+  </div>
+  <div class="card-body">
+    <div class="row g-3">
+      <div class="col-md-3">
+        <div class="text-center">
+          <div class="text-muted small">Min Time</div>
+          <div class="h5">{{ "%.2f"|format(perf_summary.get('encryption', {}).get('min_ms', 0)) }} ms</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="text-center">
+          <div class="text-muted small">Average</div>
+          <div class="h5">{{ "%.2f"|format(perf_summary.get('encryption', {}).get('avg_ms', 0)) }} ms</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="text-center">
+          <div class="text-muted small">Max Time</div>
+          <div class="h5">{{ "%.2f"|format(perf_summary.get('encryption', {}).get('max_ms', 0)) }} ms</div>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <div class="text-center">
+          <div class="text-muted small">Operations</div>
+          <div class="h5">{{ perf_summary.get('encryption', {}).get('count', 0) }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if recent_searches %}
+<div class="card">
+  <div class="card-header">
+    <h5 class="mb-0">Recent Searches</h5>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Query</th>
+          <th>Type</th>
+          <th>Keywords</th>
+          <th>Results</th>
+          <th>Time (ms)</th>
+          <th>Timestamp</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for search in recent_searches[:15] %}
+          <tr>
+            <td>
+              <code class="small">{{ search.query }}</code>
+            </td>
+            <td>
+              {% if search.search_type == 'conjunctive' %}
+                <span class="badge bg-primary">AND</span>
+              {% else %}
+                <span class="badge bg-secondary">Single</span>
+              {% endif %}
+            </td>
+            <td>{{ search.keyword_count }}</td>
+            <td>{{ search.result_count }}</td>
+            <td><strong>{{ "%.2f"|format(search.duration_ms) }}</strong></td>
+            <td><small>{{ search.timestamp }}</small></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-info">No search history available yet.</div>
+{% endif %}
+
+<div class="alert alert-info mt-4">
+  <strong>📊 Performance Metrics Explained:</strong>
+  <ul class="mb-0 mt-2">
+    <li><strong>Encryption:</strong> Time to encrypt document and generate AES keys</li>
+    <li><strong>Search:</strong> Time to generate search tokens and query CUBE index</li>
+    <li><strong>CUBE Updates:</strong> Time to build or update CUBE index structure</li>
+  </ul>
+</div>
+{% endblock %}

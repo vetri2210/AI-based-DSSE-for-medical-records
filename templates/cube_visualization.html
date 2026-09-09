@@ -1,0 +1,170 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2 class="mb-4">📊 CUBE Index Visualization</h2>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-body text-center">
+        <div class="text-muted">Total Documents</div>
+        <div class="h3 mb-0">{{ cube_stats.get('total_documents', 0) }}</div>
+        <small class="text-muted">Encrypted in system</small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-body text-center">
+        <div class="text-muted">Indexed Documents</div>
+        <div class="h3 mb-0">{{ cube_stats.get('indexed_documents', 0) }}</div>
+        <small class="text-muted">In CUBE index</small>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-3">
+    <div class="card border-primary">
+      <div class="card-body text-center">
+        <div class="text-muted small">LCIC Entries</div>
+        <div class="h4 mb-0 text-primary">{{ cube_stats.get('lcic_entries', 0) }}</div>
+        <small class="text-muted">Logical Counter Index</small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card border-success">
+      <div class="card-body text-center">
+        <div class="text-muted small">HKI Entries</div>
+        <div class="h4 mb-0 text-success">{{ cube_stats.get('hki_entries', 0) }}</div>
+        <small class="text-muted">Horizontal Keyword Index</small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card border-info">
+      <div class="card-body text-center">
+        <div class="text-muted small">VKIC Entries</div>
+        <div class="h4 mb-0 text-info">{{ cube_stats.get('vkic_entries', 0) }}</div>
+        <small class="text-muted">Vertical Keyword Index Chain</small>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card border-warning">
+      <div class="card-body text-center">
+        <div class="text-muted small">DIC Entries</div>
+        <div class="h4 mb-0 text-warning">{{ cube_stats.get('dic_entries', 0) }}</div>
+        <small class="text-muted">Document Index Chain</small>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <h5 class="mb-0">CUBE Components Architecture</h5>
+  </div>
+  <div class="card-body">
+    <div class="row g-3">
+      <div class="col-md-6">
+        <div class="alert alert-light border">
+          <h6 class="mb-2">🔢 LCIC (Logical Counter Index Chain)</h6>
+          <p class="mb-0 small">
+            Maintains counter values for each keyword token. Supports forward privacy by 
+            preventing linking of updates to previous search operations.
+          </p>
+          <div class="mt-2 small">
+            <strong>Entries:</strong> {{ cube_stats.get('lcic_entries', 0) }}
+          </div>
+        </div>
+      </div>
+      
+      <div class="col-md-6">
+        <div class="alert alert-light border">
+          <h6 class="mb-2">🎯 HKI (Horizontal Keyword Index)</h6>
+          <p class="mb-0 small">
+            Maps encrypted keyword tokens to sets of document IDs. Enables efficient 
+            search without decrypting documents.
+          </p>
+          <div class="mt-2 small">
+            <strong>Entries:</strong> {{ cube_stats.get('hki_entries', 0) }}
+          </div>
+        </div>
+      </div>
+      
+      <div class="col-md-6">
+        <div class="alert alert-light border">
+          <h6 class="mb-2">⛓️ VKIC (Vertical Keyword Index Chain)</h6>
+          <p class="mb-0 small">
+            Maintains version chains for keyword-document pairs. Supports backward privacy 
+            by ensuring deleted documents cannot be recovered through stale index states.
+          </p>
+          <div class="mt-2 small">
+            <strong>Entries:</strong> {{ cube_stats.get('vkic_entries', 0) }}
+          </div>
+        </div>
+      </div>
+      
+      <div class="col-md-6">
+        <div class="alert alert-light border">
+          <h6 class="mb-2">📑 DIC (Document Index Chain)</h6>
+          <p class="mb-0 small">
+            Tracks which documents have been indexed with which keywords. Used for 
+            managing dynamic insertion and deletion operations.
+          </p>
+          <div class="mt-2 small">
+            <strong>Entries:</strong> {{ cube_stats.get('dic_entries', 0) }}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if keyword_mappings %}
+<div class="card">
+  <div class="card-header">
+    <h5 class="mb-0">Sample Keyword-Document Mappings (HKI)</h5>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>Keyword Token (Encrypted)</th>
+          <th>Documents Indexed</th>
+          <th>Details</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for mapping in keyword_mappings %}
+          <tr>
+            <td>
+              <code class="text-break small">{{ mapping.token }}</code>
+              <small class="text-muted d-block">(full: {{ mapping.token_full[:32] }}...)</small>
+            </td>
+            <td>{{ mapping.doc_count }}</td>
+            <td>
+              <small class="text-muted">
+                This encrypted token maps to {{ mapping.doc_count }} document(s). 
+                The actual keyword remains encrypted.
+              </small>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-info">No keyword mappings to display yet. Upload documents to build the CUBE index.</div>
+{% endif %}
+
+<div class="alert alert-warning mt-4">
+  <strong>⚠️ Privacy Notice:</strong>
+  The CUBE index uses cryptographic tokens (not plaintext keywords) as searchable identifiers.
+  Keyword tokens displayed here are HMAC-derived and do not reveal the original keywords.
+  This protects against keyword exposure while enabling secure search.
+</div>
+{% endblock %}

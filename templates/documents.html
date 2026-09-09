@@ -24,8 +24,13 @@
             <td>{{ doc.upload_date }}</td>
             <td>{{ doc.owner }}</td>
             <td>
-              <a class="btn btn-sm btn-outline-primary" href="{{ url_for('document_detail', document_id=doc.id) }}">Details</a>
-              <a class="btn btn-sm btn-outline-success" href="{{ url_for('decrypt', document_id=doc.id) }}">Decrypt</a>
+              <div class="btn-group btn-group-sm" role="group">
+                <a class="btn btn-outline-primary" href="{{ url_for('document_detail', document_id=doc.id) }}">View</a>
+                <a class="btn btn-outline-success" href="{{ url_for('decrypt', document_id=doc.id) }}">Decrypt</a>
+                <form method="POST" action="{{ url_for('delete_document', document_id=doc.id) }}" style="display: inline;">
+                  <button class="btn btn-outline-danger" type="submit" onclick="return confirm('Delete this document?')">Delete</button>
+                </form>
+              </div>
             </td>
           </tr>
           {% endfor %}

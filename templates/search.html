@@ -1,0 +1,46 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <div class="card shadow-sm">
+      <div class="card-body">
+        <h3 class="card-title mb-4">🔍 Secure Medical Record Search</h3>
+        
+        <p class="text-muted mb-4">
+          Search your encrypted medical documents using CUBE-based searchable encryption.
+          Your documents remain encrypted while searches are performed securely.
+        </p>
+        
+        <form method="post" class="mb-4">
+          <div class="mb-3">
+            <label class="form-label">Search Query</label>
+            <input 
+              class="form-control form-control-lg" 
+              type="text" 
+              name="query" 
+              placeholder='e.g., "diabetes AND hypertension"'
+              value="{{ query }}"
+            />
+            <small class="text-muted d-block mt-2">
+              💡 Use "AND" to search for multiple keywords.<br>
+              Example: <code>diabetes AND hypertension</code>
+            </small>
+          </div>
+          
+          <button class="btn btn-primary btn-lg w-100" type="submit">Search Documents</button>
+        </form>
+        
+        <div class="alert alert-info">
+          <strong>How it works:</strong>
+          <ul class="mb-0 mt-2">
+            <li>Your search query is transformed into secure search tokens</li>
+            <li>The CUBE index is searched without decrypting documents</li>
+            <li>Only matching encrypted documents are retrieved</li>
+            <li>Results are decrypted only when you authorize it</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

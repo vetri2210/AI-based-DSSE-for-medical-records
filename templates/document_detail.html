@@ -7,7 +7,7 @@
         <h3 class="card-title">{{ document.filename }}</h3>
         <p class="text-muted mb-0">Uploaded: {{ document.upload_date }}</p>
       </div>
-      <a class="btn btn-success" href="{{ url_for('decrypt', document_id=document.id) }}">Decrypt</a>
+      <a class="btn btn-outline-primary" href="{{ url_for('decrypt', document_id=document.id) }}">Decrypt</a>
     </div>
 
     <div class="mb-4">

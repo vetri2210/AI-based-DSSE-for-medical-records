@@ -180,6 +180,9 @@
             <li class="nav-item"><a class="nav-link" href="{{ url_for('search') }}">Search</a></li>
             <li class="nav-item"><a class="nav-link" href="{{ url_for('cube_dashboard') }}">CUBE Index</a></li>
             <li class="nav-item"><a class="nav-link" href="{{ url_for('performance') }}">Performance</a></li>
+            {% if session.role == 'admin' %}
+            <li class="nav-item"><a class="nav-link" href="{{ url_for('admin_key_status') }}">Key Recovery</a></li>
+            {% endif %}
             <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
             {% else %}
             <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>

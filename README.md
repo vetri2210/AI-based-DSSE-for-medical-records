@@ -2,9 +2,83 @@
 
 ## 📋 Project Overview
 
-This is a complete implementation of **Forward and Backward Private Conjunctive Dynamic Searchable Symmetric Encryption (DSSE)** for a secure medical records system.
+This is a Flask/SQLite healthcare-document application with AES-GCM file encryption and deterministic HMAC keyword search, including AND queries.
 
-**Status:** ✅ COMPLETE - All features implemented, tested (100% pass rate), and documented.
+**Status:** Review 3 recovery, Phase 3A local semantic expansion, and Phase 3B result-integrity proofs are implemented. Formal forward/backward privacy and search completeness are not proven.
+
+> **Current status:** The application supports tokenized keyword and AND search, and
+> now includes authenticated local key/index-state checks, automatic key rotation,
+> transactional CUBE reconstruction, and post-compromise recovery. These operational
+> recovery controls do **not** prove formal forward/backward privacy. Semantic
+> expansion is an optional local dictionary enhancement, not cryptographic protection.
+> Phase 3B adds signed Merkle membership proofs for result integrity/authenticity, but
+> does not prove completeness. Historical completion,
+> production-readiness, and test-count claims below are superseded by current test runs.
+
+## Review 3 Recovery Features
+
+- The active search key has a monotonically increasing version. Versioned key files
+  are stored separately from per-document AES-GCM keys; search-key rotation does not
+  re-encrypt documents.
+- A keyed HMAC authenticates the active version/status, CUBE rows (LCIC, HKI, VKIC,
+  DIC), and the authoritative document-owner/keyword records. A mismatch, invalid
+  version, missing key, or inactive state triggers controlled recovery.
+- Recovery rebuilds all four CUBE structures from `documents` and `keywords` inside a
+  SQLite transaction. Keyword searches, per-document AND intersections, ownership
+  scoping, and referential consistency are checked before the candidate is activated.
+- Administrators can view safe version/status/timestamp/event information and manually
+  start key rotation and reconstruction at **Key Recovery**. No key or token secret is
+  shown on that page.
+- The integrity check detects changes that lack a valid MAC. Since both database and
+  key files are local, it cannot detect rollback of both together or an attacker who
+  already possesses the search key. The existing deterministic HMAC-token construction
+  does not establish formal forward/backward privacy. Phase 3A semantic expansion and
+  Phase 3B result-integrity proofs are described below.
+
+## Phase 3A Semantic Query Expansion
+
+When **Enable Semantic Search** is selected, a deterministic local medical synonym map
+expands free-text queries before any CUBE HMAC token is generated. It includes the
+original normalized query words and adds controlled related terms (for example,
+`high blood sugar treatment` expands with `diabetes`, `glucose`, `hyperglycemia`, and
+`insulin`). The expanded terms are searched as alternatives through the existing
+single-keyword CUBE lookup and then passed through the existing user-scoped results
+filter. Exact search remains the default and retains existing behavior. Explicit
+`AND` queries are never expanded and continue to use conjunctive CUBE search.
+
+The expansion module is offline, has no key or database inputs, and uses no remote API
+or downloaded model. The mapping is intentionally small and rule-based; it may miss
+medical synonyms or add an inappropriate related term, so semantic results are a
+search convenience rather than a clinical interpretation or cryptographic guarantee.
+API callers may opt in with a JSON boolean, e.g.
+`{"query":"high blood sugar treatment","semantic":true}`.
+
+## Phase 3B Verifiable Search Results
+
+When result verification is enabled in the search form or with
+`{"query":"diabetes","verify":true}`, the application first validates the Phase 2
+authenticated index state, then builds a deterministic Merkle tree from the authorized
+scope's stored document-owner and normalized-keyword metadata. Each unique leaf is the
+canonical JSON array `[user_id, normalized_keyword, document_id, key_version]`.
+SHA-256 hashes are domain-separated for leaves and internal nodes. The tree is computed
+from the authoritative SQLite records on demand, so insertions, deletions, key rotation,
+and CUBE reconstruction are reflected without modifying LCIC, HKI, VKIC, DIC, or
+document encryption.
+
+The Merkle root, active key version, user scope, and leaf count are signed with a
+persistent Ed25519 signing key held in `.instance/verification_signing_key`. Responses
+contain only the public key, root signature, and membership proofs. API clients should
+pin the expected public key through a trusted channel before accepting signatures; a
+public key received only alongside a response is not, by itself, a trust anchor. The
+search-results page independently checks the root signature and each returned
+membership proof in the browser. Verification is opt-in and does not change the
+existing exact, conjunctive, or semantic search behavior.
+
+**The implemented Merkle proof provides result integrity/authenticity verification but does not by itself prove completeness against result omission.**
+It confirms that each proven `(user, keyword, document, version)` membership is in the
+signed index. It does not prove that the server returned every matching result, nor
+that a search server did not omit a result. The root signature authenticates the tree
+root, not the correctness or completeness of the search algorithm.
 
 ---
 
@@ -23,9 +97,13 @@ Then open: `http://127.0.0.1:5000`
 
 ### 3. Run Tests
 ```bash
+python -m unittest -v test_phase1_security test_phase2_recovery test_phase3a_semantic test_phase3b_verifiable
 python test_review2.py
+python test_threading_fix.py
 ```
-Expected output: **10/10 tests passing (100% success rate)**
+The unittest command covers Phase 1 security, Review 3 recovery, and Phase 3A/3B
+verification tests; the separate scripts run the Review 2 behavior suite and
+threading smoke test.
 
 ---
 
@@ -85,13 +163,15 @@ AI-based-DSSE-for-medical-records/
 │   └── README.md                      ← This file
 │
 ├── 🔧 CORE APPLICATION
-│   ├── app.py                         ← Flask application (MODIFIED for Review 2)
-│   ├── cube.py                        ← CUBE index implementation (NEW)
+│   ├── app.py                         ← Flask application and recovery lifecycle
+│   ├── cube.py                        ← Versioned LCIC/HKI/VKIC/DIC index
 │   ├── performance.py                 ← Performance measurement (NEW)
 │   └── requirements.txt               ← Dependencies
 │
 ├── ✅ TESTING
-│   └── test_review2.py               ← Test suite (NEW, 10 tests, 100% pass)
+│   ├── test_phase1_security.py        ← Phase 1 regression tests
+│   ├── test_phase2_recovery.py        ← Review 3 recovery tests
+│   └── test_review2.py                ← Legacy Review 2 regression script
 │
 ├── 🎨 TEMPLATES
 │   ├── layout.html                   ← Base template (MODIFIED)
@@ -123,11 +203,11 @@ AI-based-DSSE-for-medical-records/
 
 The **CUBE** (Cryptographically-secure Unified Backend Encryption) is a 4-component searchable index:
 
-| Component | Purpose | Privacy Guarantee |
+| Component | Purpose | Status |
 |-----------|---------|-------------------|
-| **LCIC** | Counter per keyword | Forward privacy |
-| **HKI** | Keyword→Document mapping | Enables encrypted search |
-| **VKIC** | Version chains | Backward privacy |
+| **LCIC** | Counter per keyword | Operational index metadata; no formal privacy claim |
+| **HKI** | Keyword→Document mapping | Enables deterministic token search |
+| **VKIC** | Version chains | Operational index metadata; no formal privacy claim |
 | **DIC** | Document→Keyword pairs | Dynamic management |
 
 ### Key Features
@@ -135,10 +215,10 @@ The **CUBE** (Cryptographically-secure Unified Backend Encryption) is a 4-compon
 1. **Searchable Encryption** - Search without decryption
 2. **Conjunctive Search** - "keyword1 AND keyword2" queries
 3. **Dynamic Management** - Add/delete documents anytime
-4. **Privacy Guarantees** - Forward & backward privacy
-5. **Performance Tracking** - Real-time metrics dashboard
-6. **Full Test Coverage** - 10 tests, 100% passing
-7. **Production Ready** - No errors, fully documented
+4. **Key Recovery** - Authenticated state detection, versioned rotation, and CUBE reconstruction
+5. **Semantic Search** - Optional local medical-term expansion before tokenization
+6. **Performance Tracking** - Real-time metrics dashboard
+7. **Regression Tests** - Phase 1, Review 2, Review 3, and Phase 3A coverage
 
 ---
 
@@ -148,39 +228,26 @@ The **CUBE** (Cryptographically-secure Unified Backend Encryption) is a 4-compon
 - **Algorithm:** AES-256-GCM (authenticated)
 - **Key Size:** 256-bit per document
 - **Mode:** Galois/Counter Mode (AEAD)
+- **Document encryption lifecycle:** Per-document AES keys remain separate from the search key. Search-key rotation does not re-encrypt documents.
 
 ### Searchable Index
 - **Token Generation:** HMAC-SHA256(search_key, keyword)
-- **Forward Privacy:** LCIC counters prevent linking
-- **Backward Privacy:** VKIC 'deleted' state prevents recovery
-- **Keyword Privacy:** Plaintext keywords never stored
+- **Search behavior:** Deterministic tokens support single-keyword and AND search.
+- **Keyword metadata:** Plaintext keywords are stored in the local SQLite `keywords` table as the reconstruction source; this is not a zero-knowledge or encrypted-keyword database.
+- **Integrity/recovery:** HMAC-authenticated state detects mismatches and triggers reconstruction. This is not a proof of search-result correctness against a malicious server.
+- **Privacy limitation:** LCIC counters and VKIC deletion records do not establish formal forward or backward privacy.
 
-### No Leakage Beyond
-- Search pattern (which keywords searched together)
-- Access pattern (document size/retrieval frequency)
-- Update information (when documents added/removed)
-- Volume information (number of documents/keywords)
+The application exposes deterministic search/access patterns and local keyword metadata. The current construction does not claim to eliminate those leakage channels.
 
 ---
 
 ## ✅ Testing
 
-### Test Suite: 10/10 Passing
+### Legacy Review 2 Test Suite
 
-```
-Test 1:  ✓ CUBE Index Initialization
-Test 2:  ✓ Search Token Generation
-Test 3:  ✓ Single Keyword Search
-Test 4:  ✓ Conjunctive AND Search
-Test 5:  ✓ Dynamic Insertion
-Test 6:  ✓ Dynamic Deletion
-Test 7:  ✓ CUBE Statistics
-Test 8:  ✓ Keyword Privacy
-Test 9:  ✓ Performance Logging
-Test 10: ✓ Review-1 Compatibility
-
-Success Rate: 100.0%
-```
+The Review 2 script contains 10 regression checks. Run the current Phase 1 and
+Review 3 test suites as well; do not interpret the historical Review 2 test count as
+coverage of recovery or formal privacy properties.
 
 ### Run Tests
 ```bash
@@ -197,9 +264,9 @@ python test_review2.py
 3. **Single Search** - Search "diabetes" (returns matching docs)
 4. **Conjunctive Search** - Search "diabetes AND hypertension" (exact matches)
 5. **Dynamic Insertion** - Upload new doc, search immediately finds it
-6. **Dynamic Deletion** - Delete doc, search no longer returns it ← **Backward Privacy**
+6. **Dynamic Deletion** - Delete a document and confirm it no longer appears in search
 7. **Performance** - Show average operation timings
-8. **Security** - Explain privacy guarantees
+8. **Security** - Explain the implemented integrity controls and their limitations
 
 For detailed demo instructions, see [QUICKSTART.md](QUICKSTART.md).
 
@@ -232,7 +299,7 @@ For detailed demo instructions, see [QUICKSTART.md](QUICKSTART.md).
 ### Preserved from Review-1
 - `users` - User accounts
 - `documents` - Document metadata
-- `keywords` - Keyword extraction (for display only)
+- `keywords` - Stored keyword metadata used for reconstruction and display
 
 ---
 
@@ -243,6 +310,8 @@ For detailed demo instructions, see [QUICKSTART.md](QUICKSTART.md).
 - `GET /search` - Search interface
 - `GET /search/results` - Display results
 - `GET /cube-dashboard` - CUBE visualization
+- `GET /admin/key-status` - Admin-only key/index status and recovery events
+- `POST /admin/key-status/recover` - Admin-only key rotation and CUBE rebuild
 - `GET /performance` - Performance metrics
 - `POST /document/<id>/delete` - Delete with CUBE update
 - `POST /upload` - Upload & encrypt
@@ -268,14 +337,14 @@ All Review-1 tests still passing. No functionality removed.
 
 ---
 
-## 🔮 Review-3 (Not Yet Implemented)
+## Review 3 and Remaining Scope
 
-The following features are reserved for Review 3:
-- Key compromise detection
-- Automatic key rotation
-- Self-healing security mechanism
-- CUBE reconstruction after compromise
-- Post-compromise recovery
+Implemented in this phase: authenticated key/index-state checks, key versioning,
+automatic rotation, transactional reconstruction of LCIC/HKI/VKIC/DIC, and
+post-compromise recovery/self-healing. This does not provide formal DSSE forward or
+backward privacy. Phase 3A implements optional local semantic query expansion before
+HMAC token generation. Phase 3B adds membership integrity/authenticity proofs, but not
+result completeness verification.
 
 ---
 
@@ -295,8 +364,8 @@ python -c "from app import app; app.run(port=5001)"
 
 ### Database errors
 ```bash
-# Remove old database and restart
-rm database.db
+# Back up the existing database before investigating a schema issue
+copy database.db database.db.backup
 python app.py
 ```
 

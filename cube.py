@@ -8,8 +8,9 @@ consisting of:
 - VKIC (Vertical Keyword Index Chain)
 - DIC (Document Index Chain)
 
-The CUBE allows searching encrypted documents without decryption while maintaining
-forward and backward privacy.
+The CUBE supports tokenized keyword lookup over encrypted-document metadata.
+Its stored counters and version states do not by themselves establish formal
+forward or backward privacy.
 """
 
 import hmac
@@ -25,13 +26,13 @@ class CUBEIndex:
     Searchable encryption CUBE index implementation.
     
     Components:
-    - LCIC: Logical Counter Index Chain (tracks update counters for forward privacy)
+    - LCIC: Logical Counter Index Chain (tracks update counters)
     - HKI: Horizontal Keyword Index (maps keyword tokens to document sets)
-    - VKIC: Vertical Keyword Index Chain (maintains version chains for backward privacy)
+    - VKIC: Vertical Keyword Index Chain (maintains version/state records)
     - DIC: Document Index Chain (tracks documents and their indexed keywords)
     """
     
-    def __init__(self, db_getter, search_key: bytes):
+    def __init__(self, db_getter, search_key: bytes, key_version: int = 1):
         """
         Initialize CUBE index.
         
@@ -50,6 +51,7 @@ class CUBEIndex:
         
         self.search_key = search_key
         self.search_key_hex = search_key.hex()
+        self.key_version = key_version
         
     def create_tables(self):
         """Create CUBE index tables if they don't exist."""
@@ -57,11 +59,12 @@ class CUBEIndex:
         cursor = db.cursor()
         
         # LCIC: Logical Counter Index Chain
-        # Tracks counters for each keyword to support forward privacy
+        # Tracks update counters for each keyword token.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cube_lcic (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword_token TEXT UNIQUE NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
                 counter INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -75,6 +78,7 @@ class CUBEIndex:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword_token TEXT NOT NULL,
                 document_id INTEGER NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
                 indexed_at TEXT NOT NULL,
                 FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
                 UNIQUE(keyword_token, document_id)
@@ -82,12 +86,13 @@ class CUBEIndex:
         ''')
         
         # VKIC: Vertical Keyword Index Chain
-        # Maintains version chains for each keyword-document pair (backward privacy)
+        # Maintains version/state records for each keyword-document pair.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cube_vkic (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword_token TEXT NOT NULL,
                 document_id INTEGER NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
                 version INTEGER NOT NULL,
                 state TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -102,6 +107,7 @@ class CUBEIndex:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 document_id INTEGER NOT NULL,
                 keyword_token TEXT NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
                 indexed_at TEXT NOT NULL,
                 FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
             )
@@ -115,6 +121,14 @@ class CUBEIndex:
                 created_at TEXT NOT NULL
             )
         ''')
+
+        for table in ("cube_lcic", "cube_hki", "cube_vkic", "cube_dic"):
+            cursor.execute(f"PRAGMA table_info({table})")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "key_version" not in columns:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1"
+                )
         
         db.commit()
         
@@ -127,13 +141,14 @@ class CUBEIndex:
         
         Args:
             keyword: Plaintext keyword to tokenize
-            counter: Optional counter for forward privacy (prevents linking updates)
+            counter: Optional counter value for token derivation. Normal searches
+                and updates use deterministic counter-free tokens.
         
         Returns:
             Hex-encoded search token (64 bytes / 128 hex chars)
         """
         if counter is not None:
-            # Include counter to support forward privacy (prevent update linking)
+            # The counter option is not used by the normal search/update paths.
             message = f"{keyword}:{counter}".encode('utf-8')
         else:
             message = keyword.encode('utf-8')
@@ -142,7 +157,13 @@ class CUBEIndex:
         token = hmac.new(self.search_key, message, hashlib.sha256).digest()
         return token.hex()
     
-    def add_document_index(self, document_id: int, keywords: List[str], timestamp: str) -> Tuple[int, int, int, int]:
+    def add_document_index(
+        self,
+        document_id: int,
+        keywords: List[str],
+        timestamp: str,
+        commit: bool = True,
+    ) -> Tuple[int, int, int, int]:
         """
         Add a document to the CUBE index.
         
@@ -168,7 +189,7 @@ class CUBEIndex:
             # Generate search token
             token = self.generate_search_token(keyword)
             
-            # Update LCIC (increment counter for forward privacy)
+            # Update the LCIC counter.
             cursor.execute('''
                 SELECT counter FROM cube_lcic WHERE keyword_token = ?
             ''', (token,))
@@ -184,23 +205,25 @@ class CUBEIndex:
             else:
                 counter = 0
                 cursor.execute('''
-                    INSERT INTO cube_lcic (keyword_token, counter, created_at, updated_at)
-                    VALUES (?, ?, ?, ?)
-                ''', (token, counter, timestamp, timestamp))
+                    INSERT INTO cube_lcic
+                    (keyword_token, key_version, counter, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (token, self.key_version, counter, timestamp, timestamp))
             lcic_entries += 1
             
             # Update HKI (add document to keyword's document set)
             try:
                 cursor.execute('''
-                    INSERT INTO cube_hki (keyword_token, document_id, indexed_at)
-                    VALUES (?, ?, ?)
-                ''', (token, document_id, timestamp))
+                    INSERT INTO cube_hki
+                    (keyword_token, document_id, key_version, indexed_at)
+                    VALUES (?, ?, ?, ?)
+                ''', (token, document_id, self.key_version, timestamp))
                 hki_entries += 1
             except sqlite3.IntegrityError:
                 # Already indexed
                 pass
             
-            # Update VKIC (add version entry for backward privacy)
+            # Add a VKIC version/state entry.
             cursor.execute('''
                 SELECT COUNT(*) FROM cube_vkic 
                 WHERE keyword_token = ? AND document_id = ?
@@ -208,29 +231,33 @@ class CUBEIndex:
             version = cursor.fetchone()[0]
             
             cursor.execute('''
-                INSERT INTO cube_vkic 
-                (keyword_token, document_id, version, state, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (token, document_id, version, 'active', timestamp))
+                INSERT INTO cube_vkic
+                (keyword_token, document_id, key_version, version, state, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (token, document_id, self.key_version, version, 'active', timestamp))
             vkic_entries += 1
             
             # Update DIC (document-keyword mapping)
             try:
                 cursor.execute('''
-                    INSERT INTO cube_dic (document_id, keyword_token, indexed_at)
-                    VALUES (?, ?, ?)
-                ''', (document_id, token, timestamp))
+                    INSERT INTO cube_dic
+                    (document_id, keyword_token, key_version, indexed_at)
+                    VALUES (?, ?, ?, ?)
+                ''', (document_id, token, self.key_version, timestamp))
                 dic_entries += 1
             except sqlite3.IntegrityError:
                 # Already exists
                 pass
         
-        db.commit()
+        if commit:
+            db.commit()
         return (lcic_entries, hki_entries, vkic_entries, dic_entries)
     
-    def remove_document_index(self, document_id: int, timestamp: str) -> Tuple[int, int, int, int]:
+    def remove_document_index(
+        self, document_id: int, timestamp: str, commit: bool = True
+    ) -> Tuple[int, int, int, int]:
         """
-        Remove a document from the CUBE index (backward privacy).
+        Remove a document from the active CUBE search index.
         
         Invalidates all related index entries so deleted documents cannot be recovered
         through stale searchable index states.
@@ -257,7 +284,7 @@ class CUBEIndex:
         dic_deleted = 0
         
         for token in keywords:
-            # Update LCIC counter (forward privacy on deletion)
+            # Record the index update in LCIC.
             cursor.execute('''
                 UPDATE cube_lcic SET counter = counter + 1, updated_at = ?
                 WHERE keyword_token = ?
@@ -270,7 +297,7 @@ class CUBEIndex:
             ''', (token, document_id))
             hki_deleted += cursor.rowcount
             
-            # Invalidate in VKIC (mark as deleted)
+            # Mark VKIC records as deleted.
             cursor.execute('''
                 UPDATE cube_vkic 
                 SET state = 'deleted', created_at = ?
@@ -284,7 +311,8 @@ class CUBEIndex:
             ''', (document_id, token))
             dic_deleted += cursor.rowcount
         
-        db.commit()
+        if commit:
+            db.commit()
         return (lcic_affected, hki_deleted, vkic_invalidated, dic_deleted)
     
     def search_single_keyword(self, keyword: str) -> List[int]:
@@ -303,9 +331,9 @@ class CUBEIndex:
         
         # Query HKI for documents with this keyword token
         cursor.execute('''
-            SELECT DISTINCT document_id FROM cube_hki 
-            WHERE keyword_token = ?
-        ''', (token,))
+            SELECT DISTINCT document_id FROM cube_hki
+            WHERE keyword_token = ? AND key_version = ?
+        ''', (token, self.key_version))
         
         return [row[0] for row in cursor.fetchall()]
     
@@ -334,15 +362,15 @@ class CUBEIndex:
         # Find documents in all keyword sets (intersection)
         placeholders = ','.join(['?' for _ in tokens])
         cursor.execute(f'''
-            SELECT document_id FROM cube_hki 
-            WHERE keyword_token IN ({placeholders})
+            SELECT document_id FROM cube_hki
+            WHERE keyword_token IN ({placeholders}) AND key_version = ?
             GROUP BY document_id
             HAVING COUNT(DISTINCT keyword_token) = ?
-        ''', tokens + [len(tokens)])
+        ''', tokens + [self.key_version, len(tokens)])
         
         return [row[0] for row in cursor.fetchall()]
     
-    def get_cube_stats(self) -> dict:
+    def get_cube_stats(self, user_id: Optional[int] = None) -> dict:
         """
         Get statistics about the CUBE index.
         
@@ -352,25 +380,71 @@ class CUBEIndex:
         db = self.db_getter()
         cursor = db.cursor()
         
-        cursor.execute('SELECT COUNT(*) FROM documents WHERE encrypted_path IS NOT NULL')
+        if user_id is None:
+            cursor.execute('SELECT COUNT(*) FROM documents WHERE encrypted_path IS NOT NULL')
+        else:
+            cursor.execute(
+                'SELECT COUNT(*) FROM documents WHERE encrypted_path IS NOT NULL AND owner = ?',
+                (user_id,),
+            )
         total_documents = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(DISTINCT document_id) FROM cube_dic')
+        dic_scope = (
+            ''
+            if user_id is None
+            else ' JOIN documents d ON d.id = cube_dic.document_id WHERE d.owner = ?'
+        )
+        parameters = () if user_id is None else (user_id,)
+        cursor.execute(
+            f'SELECT COUNT(DISTINCT cube_dic.document_id) FROM cube_dic{dic_scope}',
+            parameters,
+        )
         indexed_documents = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(DISTINCT keyword_token) FROM cube_lcic')
+        token_scope = (
+            ''
+            if user_id is None
+            else ' JOIN cube_hki h ON h.keyword_token = cube_lcic.keyword_token'
+            ' JOIN documents d ON d.id = h.document_id WHERE d.owner = ?'
+        )
+        cursor.execute(
+            f'SELECT COUNT(DISTINCT cube_lcic.keyword_token) FROM cube_lcic{token_scope}',
+            parameters,
+        )
         total_keywords = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(*) FROM cube_lcic')
+        cursor.execute(
+            f'SELECT COUNT(DISTINCT cube_lcic.keyword_token) FROM cube_lcic{token_scope}',
+            parameters,
+        )
         lcic_entries = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(*) FROM cube_hki')
+        hki_scope = (
+            ''
+            if user_id is None
+            else ' JOIN documents d ON d.id = cube_hki.document_id WHERE d.owner = ?'
+        )
+        cursor.execute(
+            f'SELECT COUNT(*) FROM cube_hki{hki_scope}',
+            parameters,
+        )
         hki_entries = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(*) FROM cube_vkic')
+        vkic_scope = (
+            ''
+            if user_id is None
+            else ' JOIN documents d ON d.id = cube_vkic.document_id WHERE d.owner = ?'
+        )
+        cursor.execute(
+            f'SELECT COUNT(*) FROM cube_vkic{vkic_scope}',
+            parameters,
+        )
         vkic_entries = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(*) FROM cube_dic')
+        cursor.execute(
+            f'SELECT COUNT(*) FROM cube_dic{dic_scope}',
+            parameters,
+        )
         dic_entries = cursor.fetchone()[0]
         
         return {
@@ -383,7 +457,9 @@ class CUBEIndex:
             'dic_entries': dic_entries,
         }
     
-    def get_keyword_mappings(self, limit: int = 100) -> List[dict]:
+    def get_keyword_mappings(
+        self, limit: int = 100, user_id: Optional[int] = None
+    ) -> List[dict]:
         """
         Get a sample of keyword-to-document mappings (HKI view).
         
@@ -397,13 +473,24 @@ class CUBEIndex:
         """
         db = self.db_getter()
         cursor = db.cursor()
-        cursor.execute('''
-            SELECT keyword_token, COUNT(DISTINCT document_id) as doc_count
-            FROM cube_hki
-            GROUP BY keyword_token
-            ORDER BY doc_count DESC
-            LIMIT ?
-        ''', (limit,))
+        if user_id is None:
+            cursor.execute('''
+                SELECT keyword_token, COUNT(DISTINCT document_id) as doc_count
+                FROM cube_hki
+                GROUP BY keyword_token
+                ORDER BY doc_count DESC
+                LIMIT ?
+            ''', (limit,))
+        else:
+            cursor.execute('''
+                SELECT h.keyword_token, COUNT(DISTINCT h.document_id) as doc_count
+                FROM cube_hki h
+                JOIN documents d ON d.id = h.document_id
+                WHERE d.owner = ?
+                GROUP BY h.keyword_token
+                ORDER BY doc_count DESC
+                LIMIT ?
+            ''', (user_id, limit))
         
         return [
             {'token': row[0][:16] + '...', 'token_full': row[0], 'doc_count': row[1]}

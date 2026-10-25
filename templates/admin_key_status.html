@@ -1,0 +1,61 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2 class="mb-4">Search-Key and CUBE Recovery</h2>
+
+{% if state %}
+<div class="card mb-4">
+  <div class="card-body">
+    <dl class="row mb-3">
+      <dt class="col-sm-4">Current key version</dt>
+      <dd class="col-sm-8">{{ state.key_version }}</dd>
+      <dt class="col-sm-4">Key/index status</dt>
+      <dd class="col-sm-8">{{ state.key_status }}</dd>
+      <dt class="col-sm-4">Last rotation</dt>
+      <dd class="col-sm-8">{{ state.last_rotation_at or "Not recorded" }}</dd>
+      <dt class="col-sm-4">Last recovery</dt>
+      <dd class="col-sm-8">{{ state.last_recovery_at or "Not recorded" }}</dd>
+      <dt class="col-sm-4">Last reconstruction</dt>
+      <dd class="col-sm-8">
+        {{ state.last_reconstruction_status or "Not recorded" }}
+        {% if state.last_reconstruction_at %} — {{ state.last_reconstruction_at }}{% endif %}
+      </dd>
+    </dl>
+    <form method="post" action="{{ url_for('admin_recover_search_index') }}">
+      <button class="btn btn-primary" type="submit">Rotate Key and Rebuild CUBE</button>
+    </form>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-danger">Search-key state is unavailable.</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">Recent lifecycle events</h5></div>
+  <div class="table-responsive">
+    <table class="table table-hover mb-0">
+      <thead>
+        <tr><th>Event</th><th>Status</th><th>Version</th><th>Time</th></tr>
+      </thead>
+      <tbody>
+        {% for event in events %}
+        <tr>
+          <td>{{ event.event_type }}</td>
+          <td>{{ event.status }}</td>
+          <td>{{ event.from_version or "—" }} → {{ event.to_version or "—" }}</td>
+          <td>{{ event.occurred_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="text-muted">No lifecycle events recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="alert alert-warning mt-4">
+  Integrity detection uses HMAC-authenticated local metadata and CUBE rows. It detects
+  changes that do not have a valid MAC; it cannot detect a full rollback of both the
+  database and key files or protect against an attacker who possesses the search key.
+  Key rotation and reconstruction do not establish formal forward/backward privacy.
+</div>
+{% endblock %}

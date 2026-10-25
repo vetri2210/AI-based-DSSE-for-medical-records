@@ -26,6 +26,40 @@
               Example: <code>diabetes AND hypertension</code>
             </small>
           </div>
+
+          <div class="form-check mb-3">
+            <input
+              class="form-check-input"
+              type="checkbox"
+              id="semantic-search"
+              name="semantic_search"
+              value="true"
+            />
+            <label class="form-check-label" for="semantic-search">
+              Enable Semantic Search
+            </label>
+            <small class="text-muted d-block">
+              Uses an offline medical-term map to expand natural-language queries.
+              Explicit AND queries remain conjunctive and are not expanded.
+            </small>
+          </div>
+
+          <div class="form-check mb-3">
+            <input
+              class="form-check-input"
+              type="checkbox"
+              id="verify-search"
+              name="verify_search"
+              value="true"
+            />
+            <label class="form-check-label" for="verify-search">
+              Enable Result Verification
+            </label>
+            <small class="text-muted d-block">
+              Verifies result membership and authenticity; it does not prove that
+              matching results were not omitted.
+            </small>
+          </div>
           
           <button class="btn btn-primary btn-lg w-100" type="submit">Search Documents</button>
         </form>

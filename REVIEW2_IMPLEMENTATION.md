@@ -2,14 +2,46 @@
 
 ## Overview
 
-This document describes the Review 2 implementation of **Forward and Backward Private Conjunctive Dynamic Searchable Symmetric Encryption** for a healthcare cloud-storage application.
+> **Current status correction:** Review 3 adds authenticated local key/index-state
+> checks, versioned search keys, key rotation, transactional reconstruction of LCIC,
+> HKI, VKIC, and DIC, and recovery reporting. These controls do not establish formal
+> forward/backward privacy. Phase 3A adds optional local semantic query expansion before
+> HMAC token generation. Phase 3B adds signed Merkle membership proofs for result
+> integrity/authenticity, but does not prove completeness; historical test counts and
+> readiness claims are superseded by current
+> test runs. The technical narrative below is historical; any privacy or security claim
+> in it that conflicts with this notice or the current README is not an implementation
+> guarantee.
+
+This document records the earlier Review 2 searchable-encryption design for a local healthcare-document application.
+
+## Phase 3B Verifiable Search Results
+
+Verification is opt-in from the search page or JSON API. After Phase 2 index-integrity
+validation, a deterministic SHA-256 Merkle tree is built on demand from authoritative
+document-owner and keyword records. A leaf is the canonical array
+`[user_id, normalized_keyword, document_id, key_version]`; duplicate leaves are
+deduplicated. The root, key version, user scope, and leaf count are signed with a
+persistent Ed25519 signing key stored locally in `.instance/verification_signing_key`.
+The response contains membership proofs and public verification metadata only.
+
+The search-results page verifies the signature and proofs in-browser, and API clients
+can use `verifiable_search.verify_result_proof` with a separately trusted/pinned public
+key. The verification root is regenerated from current records, so document insertions
+and deletions change the tree; including the active key version in each leaf also makes
+old proofs invalid after key rotation or reconstruction. The tree wraps existing CUBE
+results and does not change LCIC, HKI, VKIC, DIC, token generation, or AES-GCM.
+
+**The implemented Merkle proof provides result integrity/authenticity verification but does not by itself prove completeness against result omission.**
+Membership proofs do not establish that the server returned all matching results.
+Formal forward/backward privacy and complete authenticated search remain unclaimed.
 
 The system transforms the Review-1 encrypted document vault into a **searchable encrypted system** where:
 - Medical documents remain encrypted in cloud storage
 - Users can search encrypted documents without decryption
 - Only matching documents are retrieved for authorized decryption
-- Forward privacy prevents search updates from being linked
-- Backward privacy ensures deleted documents cannot be recovered
+- Search updates use deterministic keyword tokens; formal forward privacy is not established
+- Deleted documents are removed from active search results; formal backward privacy is not established
 
 ---
 
@@ -23,7 +55,7 @@ The CUBE (Cryptographically-secure Unified Backend Encryption) is the searchable
 
 **LCIC (Logical Counter Index Chain)**
 - Purpose: Track update counters for each keyword
-- Forward Privacy: Counter values prevent linking new insertions to previous search operations
+- Privacy status: counters do not prevent linking under the current deterministic token construction
 - Storage: SQLite table `cube_lcic` with fields: `keyword_token`, `counter`, `created_at`, `updated_at`
 
 **HKI (Horizontal Keyword Index)**
@@ -33,7 +65,7 @@ The CUBE (Cryptographically-secure Unified Backend Encryption) is the searchable
 
 **VKIC (Vertical Keyword Index Chain)**
 - Purpose: Maintain version chains for keyword-document pairs
-- Backward Privacy: Version states ('active'/'deleted') prevent recovering deleted documents
+- Privacy status: version states do not establish formal backward privacy
 - Storage: SQLite table `cube_vkic` with fields: `keyword_token`, `document_id`, `version`, `state`, `created_at`
 
 **DIC (Document Index Chain)**
@@ -43,17 +75,17 @@ The CUBE (Cryptographically-secure Unified Backend Encryption) is the searchable
 
 #### 2. **Secure Search Token Generation**
 
-Keywords are never exposed to the searchable index. Instead:
+The CUBE index stores HMAC tokens instead of plaintext keywords:
 
 ```
 Plaintext Keyword → HMAC-SHA256 (with search key) → Encrypted Token
 ```
 
 - Uses keyed-hash message authentication code (HMAC-SHA256)
-- Search key (32-byte) derived from master key
+- Search key (32-byte) stored separately from per-document AES keys
 - Token: 64-character hexadecimal (256-bit output)
 - Deterministic: Same keyword always produces same token
-- Prevents keyword exposure in stored index
+- Does not conceal plaintext keyword metadata stored in SQLite's `keywords` table
 
 #### 3. **Performance Measurement** (`performance.py`)
 
@@ -95,7 +127,7 @@ token = HMAC-SHA256(search_key, keyword_bytes)
 - Cryptographically secure (HMAC-based)
 - Deterministic (same keyword = same token)
 - Non-reversible (cannot recover keyword from token)
-- Supports forward privacy via counter parameter
+- The optional counter parameter is not used by normal search or insertion paths
 
 ### Feature 3: Single Keyword Search
 
@@ -175,34 +207,22 @@ CUBE index updated: 8 keywords indexed."
 
 **On Delete:**
 1. Call `cube_index.remove_document_index(doc_id, timestamp)`
-2. LCIC counter incremented (forward privacy on delete)
+2. LCIC counter updated
 3. HKI entries removed
-4. VKIC entries marked 'deleted' (backward privacy)
+4. VKIC entries marked 'deleted'
 5. DIC entries removed
 6. Delete encrypted file
 7. Delete database record
 
-**Backward Privacy:** Future searches cannot recover deleted documents
+**Search behavior:** Deleted documents are removed from active search results. This
+does not establish formal backward privacy.
 
-### Feature 10: Forward Privacy Support
+### Features 10–11: Formal Privacy Guarantees
 
-**Mechanism:**
-- Counter per keyword in LCIC
-- Counter incremented on each update
-- Counter included in token generation: `HMAC-SHA256(key, keyword + counter)`
-- Prevents linking updates to previous searches
-
-**Status Display:** "Forward Privacy: ACTIVE"
-
-### Feature 11: Backward Privacy Support
-
-**Mechanism:**
-- VKIC maintains version chains with state field
-- On deletion: Mark entries as 'deleted' instead of removing
-- Search skips 'deleted' entries
-- Prevents recovery through stale index states
-
-**Status Display:** Verified in search results
+The current implementation does not prove formal forward or backward privacy. Normal
+search and insertion use deterministic counter-free HMAC tokens; deletion removes
+records from the active index but cannot prevent an observer retaining earlier state
+from learning about deleted records.
 
 ### Feature 12: Leakage-Aware Design
 
@@ -212,7 +232,8 @@ CUBE index updated: 8 keywords indexed."
 3. **Update Information:** Counter changes reveal document updates
 4. **Volume Information:** Server learns number of documents and keywords
 
-**Mitigation:** CUBE structure and counters limit what can be inferred
+**Limitation:** The current construction does not formally mitigate these leakage
+channels. Plaintext keyword metadata is stored in SQLite for index reconstruction.
 
 ### Feature 13: Search API
 
@@ -495,26 +516,21 @@ Flash: "Document deleted. CUBE index updated."
 
 **Same Search Query:** "diabetes AND hypertension"
 
-**Result:** Deleted document no longer appears ✓ (Backward Privacy)
+**Result:** Deleted document no longer appears in active search results. This behavior
+is not a proof of backward privacy.
 
 ---
 
 ## Security Properties
 
-### Forward Privacy
-- **Achieved:** Counter values in LCIC prevent linking updates
-- **Limitation:** Server still learns update frequency
-- **Implementation:** Counter included in token generation
-
-### Backward Privacy
-- **Achieved:** VKIC version chains prevent recovery of deleted entries
-- **Limitation:** Server learns deletion timing
-- **Implementation:** Marking entries 'deleted' instead of removing
-
-### Keyword Privacy
-- **Achieved:** HMAC-based tokens never expose plaintext keywords
-- **Limitation:** Repeated searches of same keyword produce same token (search pattern)
-- **Implementation:** Secure token generation function
+### Search and Privacy Limitations
+- HMAC-SHA256 tokens are deterministic, so repeated keywords have linkable tokens.
+- The current search-token path does not use the optional LCIC counter.
+- Plaintext keywords are stored in SQLite and used as authoritative reconstruction data.
+- Deletion removes entries from active search results but does not establish formal
+  backward privacy against an observer retaining prior state.
+- Key/index integrity detection and reconstruction are operational recovery features,
+  not verifiable search proofs.
 
 ### Encryption Security
 - **Algorithm:** AES-256-GCM
@@ -576,7 +592,7 @@ Expected output: "Success Rate: 100.0%"
    - Check Dashboard: See document count increase
 2. **View Document:** Click on uploaded document
    - Observe: Extracted keywords displayed
-   - Note: These keywords are in plaintext for demonstration
+   - Note: These keywords are stored as plaintext SQLite metadata for reconstruction
 
 ### Phase 2: CUBE Visualization
 1. **Navigate:** Click "CUBE Index" in navigation

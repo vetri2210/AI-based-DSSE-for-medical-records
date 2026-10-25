@@ -2,10 +2,12 @@ import os
 import re
 import sqlite3
 import hashlib
+import hmac
 import base64
 import datetime
 import json
 import time
+import threading
 from io import BytesIO
 from uuid import uuid4
 
@@ -22,11 +24,15 @@ from flask import (
     jsonify,
 )
 from werkzeug.utils import secure_filename
+from werkzeug.security import check_password_hash, generate_password_hash
 from Crypto.Cipher import AES
+from Crypto.PublicKey import ECC
 from Crypto.Random import get_random_bytes
 
 from cube import CUBEIndex
 from performance import PerformanceTracker
+from semantic_search import expand_query
+from verifiable_search import MerkleTree, normalize_keyword, signed_manifest
 
 try:
     from PyPDF2 import PdfReader
@@ -54,16 +60,61 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 ENCRYPTED_FOLDER = os.path.join(BASE_DIR, "encrypted_docs")
 DATABASE = os.path.join(BASE_DIR, "database.db")
+INSTANCE_FOLDER = os.path.join(BASE_DIR, ".instance")
 ALLOWED_EXTENSIONS = {"pdf", "docx", "txt"}
-SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "change_this_secret")
 
-# Review 2: Searchable encryption key (derived from master key for DSSE)
-# In production, this should be derived from a master key using a KDF
-SEARCH_KEY = os.environ.get("SEARCH_KEY", "search_key_32_bytes_for_dsse").encode('utf-8')
-if len(SEARCH_KEY) < 32:
-    SEARCH_KEY = hashlib.sha256(SEARCH_KEY).digest()
-else:
-    SEARCH_KEY = SEARCH_KEY[:32]
+
+def load_or_create_secret(env_name: str, filename: str, length: int) -> bytes:
+    """Load an explicitly configured secret or create a stable local one."""
+    configured = os.environ.get(env_name)
+    if configured:
+        secret = configured.encode("utf-8")
+    else:
+        os.makedirs(INSTANCE_FOLDER, exist_ok=True)
+        secret_path = os.path.join(INSTANCE_FOLDER, filename)
+        try:
+            descriptor = os.open(
+                secret_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            secret = b""
+            for _ in range(100):
+                try:
+                    with open(secret_path, "rb") as secret_file:
+                        secret = secret_file.read()
+                except FileNotFoundError:
+                    pass
+                if len(secret) == length:
+                    break
+                time.sleep(0.01)
+            if len(secret) != length:
+                raise RuntimeError(f"Could not read complete secret file: {filename}")
+        else:
+            secret = get_random_bytes(length)
+            with os.fdopen(descriptor, "wb") as secret_file:
+                secret_file.write(secret)
+
+    if length == 32 and configured:
+        if len(secret) < length:
+            raise RuntimeError(
+                f"{env_name} must contain at least {length} bytes of key material"
+            )
+        secret = secret[:length]
+    if not secret:
+        raise RuntimeError(f"{env_name} must not be empty")
+    return secret
+
+
+SECRET_KEY = load_or_create_secret("FLASK_SECRET_KEY", "flask_secret_key", 32)
+SEARCH_KEY = load_or_create_secret("SEARCH_KEY", "search_key", 32)
+VERIFICATION_SIGNING_KEY = ECC.construct(
+    curve="Ed25519",
+    seed=load_or_create_secret(
+        "VERIFICATION_SIGNING_KEY", "verification_signing_key", 32
+    ),
+)
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -74,6 +125,618 @@ app.secret_key = SECRET_KEY
 # Global CUBE and performance tracker instances
 cube_index = None
 performance_tracker = None
+key_lifecycle_lock = threading.RLock()
+
+
+class SearchIndexRecoveryError(RuntimeError):
+    """Raised when a safe searchable-index recovery cannot be completed."""
+
+
+def _key_file_path(key_version: int) -> str:
+    return os.path.join(
+        INSTANCE_FOLDER, "search_keys", f"key-v{key_version}.bin"
+    )
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _store_versioned_key(key_version: int, key: bytes) -> str:
+    path = _key_file_path(key_version)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_path = f"{path}.{uuid4().hex}.tmp"
+    descriptor = os.open(
+        temporary_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as key_file:
+            key_file.write(key)
+            key_file.flush()
+            os.fsync(key_file.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            os.remove(temporary_path)
+        except OSError:
+            app.logger.exception("Could not remove a temporary search-key file")
+        raise
+    return path
+
+
+def _index_integrity_tag(db, key: bytes) -> str:
+    rows = {}
+    for table in ("cube_lcic", "cube_hki", "cube_vkic", "cube_dic"):
+        rows[table] = [
+            list(row)
+            for row in db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        ]
+    rows["authoritative_documents"] = [
+        list(row)
+        for row in db.execute(
+            "SELECT id, owner FROM documents ORDER BY id"
+        ).fetchall()
+    ]
+    rows["authoritative_keywords"] = [
+        list(row)
+        for row in db.execute(
+            "SELECT document_id, keyword FROM keywords ORDER BY document_id, id"
+        ).fetchall()
+    ]
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(key, b"cube-index-v1:" + payload, hashlib.sha256).hexdigest()
+
+
+def _state_integrity_tag(row, key: bytes) -> str:
+    state = {
+        "key_version": row["key_version"],
+        "key_status": row["key_status"],
+        "search_key_hash": row["search_key_hash"],
+        "index_mac": row["index_mac"],
+        "last_rotation_at": row["last_rotation_at"],
+        "last_recovery_at": row["last_recovery_at"],
+        "last_reconstruction_status": row["last_reconstruction_status"],
+        "last_reconstruction_at": row["last_reconstruction_at"],
+    }
+    payload = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(key, b"cube-state-v1:" + payload, hashlib.sha256).hexdigest()
+
+
+def _write_state_mac(db, key: bytes) -> None:
+    row = db.execute("SELECT * FROM cube_config WHERE id = 1").fetchone()
+    db.execute(
+        "UPDATE cube_config SET state_mac = ? WHERE id = 1",
+        (_state_integrity_tag(row, key),),
+    )
+
+
+def _record_lifecycle_event(
+    db, event_type: str, status: str, from_version, to_version, details: str = ""
+) -> None:
+    db.execute(
+        """
+        INSERT INTO key_lifecycle_events
+        (event_type, status, from_version, to_version, occurred_at, details)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_type,
+            status,
+            from_version,
+            to_version,
+            _utc_now_iso(),
+            details,
+        ),
+    )
+
+
+def _refresh_index_integrity(db) -> None:
+    index_mac = _index_integrity_tag(db, SEARCH_KEY)
+    db.execute(
+        "UPDATE cube_config SET index_mac = ? WHERE id = 1", (index_mac,)
+    )
+    _write_state_mac(db, SEARCH_KEY)
+
+
+def _verify_reconstructed_index(index: CUBEIndex, db) -> None:
+    """Validate all four rebuilt structures against authoritative keyword rows."""
+    source_rows = db.execute(
+        """
+        SELECT d.id AS document_id, d.owner, k.keyword
+        FROM documents d
+        JOIN keywords k ON k.document_id = d.id
+        ORDER BY d.id, k.id
+        """
+    ).fetchall()
+    expected_pairs = {
+        (index.generate_search_token(row["keyword"].lower()), row["document_id"])
+        for row in source_rows
+    }
+    expected_tokens = {token for token, _ in expected_pairs}
+    expected_counts = {}
+    for token, _ in expected_pairs:
+        expected_counts[token] = expected_counts.get(token, 0) + 1
+
+    def active_pairs(table: str, token_column: str = "keyword_token") -> set:
+        query = (
+            f"SELECT {token_column}, document_id FROM {table} "
+            "WHERE key_version = ?"
+        )
+        if table == "cube_vkic":
+            query += " AND state = 'active'"
+        return {
+            (row[0], row[1])
+            for row in db.execute(query, (index.key_version,)).fetchall()
+        }
+
+    hki_pairs = active_pairs("cube_hki")
+    dic_pairs = active_pairs("cube_dic")
+    vkic_pairs = active_pairs("cube_vkic")
+    if hki_pairs != expected_pairs or dic_pairs != expected_pairs:
+        raise SearchIndexRecoveryError("Reconstructed CUBE mappings did not validate")
+    if vkic_pairs != expected_pairs:
+        raise SearchIndexRecoveryError("Reconstructed CUBE version chain did not validate")
+    for table in ("cube_hki", "cube_dic", "cube_vkic"):
+        count = db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE key_version = ?"
+            + (" AND state = 'active'" if table == "cube_vkic" else ""),
+            (index.key_version,),
+        ).fetchone()[0]
+        if count != len(expected_pairs):
+            raise SearchIndexRecoveryError("Reconstructed CUBE contains duplicate entries")
+
+    lcic_rows = db.execute(
+        "SELECT keyword_token, counter FROM cube_lcic WHERE key_version = ?",
+        (index.key_version,),
+    ).fetchall()
+    lcic_counters = {row["keyword_token"]: row["counter"] for row in lcic_rows}
+    if set(lcic_counters) != expected_tokens:
+        raise SearchIndexRecoveryError("Reconstructed CUBE counter chain did not validate")
+    if any(lcic_counters[token] != count - 1 for token, count in expected_counts.items()):
+        raise SearchIndexRecoveryError("Reconstructed CUBE counter values did not validate")
+
+    by_keyword = {}
+    by_document = {}
+    for row in source_rows:
+        keyword = row["keyword"].lower()
+        by_keyword.setdefault(keyword, set()).add(row["document_id"])
+        by_document.setdefault(row["document_id"], set()).add(keyword)
+
+    for keyword, expected_ids in by_keyword.items():
+        if set(index.search_single_keyword(keyword)) != expected_ids:
+            raise SearchIndexRecoveryError("Single-keyword search validation failed")
+
+    conjunctions = set()
+    for keywords in by_document.values():
+        ordered_keywords = sorted(keywords)
+        for left_index, left in enumerate(ordered_keywords):
+            for right in ordered_keywords[left_index + 1:]:
+                conjunctions.add((left, right))
+    for left, right in conjunctions:
+        expected_ids = by_keyword[left] & by_keyword[right]
+        if set(index.search_conjunctive([left, right])) != expected_ids:
+            raise SearchIndexRecoveryError("AND-search validation failed")
+
+    document_ids = {
+        row[0] for row in db.execute("SELECT id FROM documents").fetchall()
+    }
+    if any(document_id not in document_ids for _, document_id in hki_pairs):
+        raise SearchIndexRecoveryError("Reconstructed index contains orphaned documents")
+
+    owners = {
+        row["id"]: row["owner"]
+        for row in db.execute("SELECT id, owner FROM documents").fetchall()
+    }
+    owner_ids = set(owners.values())
+    for owner_id in owner_ids:
+        for keyword, expected_ids in by_keyword.items():
+            authorized_ids = {
+                document_id
+                for document_id in index.search_single_keyword(keyword)
+                if owners.get(document_id) == owner_id
+            }
+            expected_owned = {
+                document_id
+                for document_id in expected_ids
+                if owners.get(document_id) == owner_id
+            }
+            if authorized_ids != expected_owned:
+                raise SearchIndexRecoveryError("User-isolation validation failed")
+
+
+def _set_lifecycle_status(db, status: str, key: bytes) -> None:
+    db.execute("UPDATE cube_config SET key_status = ? WHERE id = 1", (status,))
+    _write_state_mac(db, key)
+
+
+def rotate_search_key(recovery: bool = False, force: bool = False) -> int:
+    """Rotate the search key and atomically replace all four CUBE structures."""
+    global SEARCH_KEY, cube_index
+
+    with key_lifecycle_lock:
+        db = get_db()
+        old_key = SEARCH_KEY
+        config = None
+        old_version = 0
+        new_version = 1
+        key_path = None
+        started_at = _utc_now_iso()
+
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            config = db.execute(
+                "SELECT * FROM cube_config WHERE id = 1"
+            ).fetchone()
+            if config is None:
+                raise SearchIndexRecoveryError("Search-key state is not initialized")
+            old_version = config["key_version"]
+            if not isinstance(old_version, int) or old_version < 1:
+                old_version = 0
+            active_key_path = (
+                _key_file_path(old_version) if old_version else ""
+            )
+            if active_key_path and os.path.isfile(active_key_path):
+                with open(active_key_path, "rb") as active_key_file:
+                    persisted_key = active_key_file.read()
+                if len(persisted_key) == 32:
+                    old_key = persisted_key
+                    SEARCH_KEY = persisted_key
+                    cube_index = CUBEIndex(
+                        get_db, persisted_key, key_version=old_version
+                    )
+            if recovery and not force and config["key_status"] == "ACTIVE":
+                active_index_mac = _index_integrity_tag(db, old_key)
+                state_valid = hmac.compare_digest(
+                    _state_integrity_tag(config, old_key),
+                    config["state_mac"] or "",
+                )
+                if (
+                    hmac.compare_digest(
+                        active_index_mac, config["index_mac"] or ""
+                    )
+                    and state_valid
+                    and hashlib.sha256(old_key).hexdigest()
+                    == config["search_key_hash"]
+                ):
+                    db.rollback()
+                    return old_version
+            new_version = old_version + 1
+            new_key = get_random_bytes(32)
+            _set_lifecycle_status(
+                db, "RECOVERING" if recovery else "ROTATING", old_key
+            )
+            _record_lifecycle_event(
+                db, "RECOVERY" if recovery else "ROTATION", "STARTED",
+                old_version, new_version,
+            )
+            key_path = _store_versioned_key(new_version, new_key)
+            candidate = CUBEIndex(get_db, new_key, key_version=new_version)
+            for table in ("cube_hki", "cube_vkic", "cube_dic", "cube_lcic"):
+                db.execute(f"DELETE FROM {table}")
+            documents = {}
+            for row in db.execute(
+                """
+                SELECT d.id AS document_id, k.keyword
+                FROM documents d JOIN keywords k ON k.document_id = d.id
+                ORDER BY d.id, k.id
+                """
+            ).fetchall():
+                documents.setdefault(row["document_id"], []).append(
+                    row["keyword"].lower()
+                )
+            for document_id, keywords in documents.items():
+                candidate.add_document_index(
+                    document_id,
+                    list(dict.fromkeys(keywords)),
+                    started_at,
+                    commit=False,
+                )
+            _verify_reconstructed_index(candidate, db)
+
+            index_mac = _index_integrity_tag(db, new_key)
+            now = _utc_now_iso()
+            db.execute(
+                """
+                UPDATE cube_config
+                SET key_version = ?, key_status = 'ACTIVE',
+                    search_key_hash = ?, index_mac = ?,
+                    last_rotation_at = ?,
+                    last_recovery_at = CASE WHEN ? THEN ? ELSE last_recovery_at END,
+                    last_reconstruction_status = 'SUCCESS',
+                    last_reconstruction_at = ?
+                WHERE id = 1
+                """,
+                (
+                    new_version,
+                    hashlib.sha256(new_key).hexdigest(),
+                    index_mac,
+                    now,
+                    int(recovery),
+                    now,
+                    now,
+                ),
+            )
+            _write_state_mac(db, new_key)
+            _record_lifecycle_event(
+                db, "RECOVERY" if recovery else "ROTATION", "SUCCESS",
+                old_version, new_version,
+            )
+            _record_lifecycle_event(
+                db, "RECONSTRUCTION", "SUCCESS", old_version, new_version
+            )
+            db.commit()
+
+            SEARCH_KEY = new_key
+            cube_index = candidate
+            try:
+                for filename in os.listdir(os.path.dirname(key_path)):
+                    if filename.startswith("key-v") and filename.endswith(".bin"):
+                        candidate_path = os.path.join(
+                            os.path.dirname(key_path), filename
+                        )
+                        if candidate_path != key_path:
+                            os.remove(candidate_path)
+            except OSError:
+                app.logger.exception("Could not remove a retired search-key file")
+            legacy_key_path = os.path.join(INSTANCE_FOLDER, "search_key")
+            try:
+                if os.path.isfile(legacy_key_path):
+                    os.remove(legacy_key_path)
+            except OSError:
+                app.logger.exception("Could not remove the legacy search-key file")
+            return new_version
+        except Exception as exc:
+            db.rollback()
+            if key_path:
+                try:
+                    os.remove(key_path)
+                except OSError:
+                    app.logger.exception("Could not remove an unused search-key file")
+            try:
+                config = db.execute(
+                    "SELECT * FROM cube_config WHERE id = 1"
+                ).fetchone()
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """
+                    UPDATE cube_config
+                    SET key_status = 'COMPROMISED',
+                        last_reconstruction_status = 'FAILED',
+                        last_reconstruction_at = ?
+                    WHERE id = 1
+                    """,
+                    (_utc_now_iso(),),
+                )
+                _write_state_mac(db, old_key)
+                _record_lifecycle_event(
+                    db, "RECOVERY" if recovery else "ROTATION", "FAILED",
+                    config["key_version"] if config else old_version,
+                    new_version,
+                    "Reconstruction or activation failed",
+                )
+                db.commit()
+            except sqlite3.Error:
+                db.rollback()
+                app.logger.exception("Could not persist search-index recovery failure")
+            app.logger.exception("Search-key rotation or CUBE reconstruction failed")
+            raise SearchIndexRecoveryError(
+                "Search-index recovery failed; the previous index was not activated"
+            ) from exc
+
+
+def search_document_ids(keywords, user_id=None):
+    """Search the CUBE and return only documents authorized for this user."""
+    if not cube_index:
+        return []
+    matched_ids = cube_index.search_conjunctive(keywords)
+    if not matched_ids:
+        return []
+    db = get_db()
+    placeholders = ",".join("?" for _ in matched_ids)
+    sql = f"SELECT id FROM documents WHERE id IN ({placeholders})"
+    parameters = list(matched_ids)
+    if user_id is not None:
+        sql += " AND owner = ?"
+        parameters.append(user_id)
+    return [row["id"] for row in db.execute(sql, parameters).fetchall()]
+
+
+def _parse_search_keywords(query: str) -> list[str]:
+    return [
+        keyword.strip().lower()
+        for keyword in re.split(r"\s+AND\s+|\s+and\s+", query)
+        if keyword.strip()
+    ]
+
+
+def _expand_search_terms(query: str, exact_keywords: list[str]):
+    """Expand natural-language queries; preserve explicit AND as exact search."""
+    if re.search(r"\s+AND\s+|\s+and\s+", query):
+        return exact_keywords, False, "conjunctive"
+    try:
+        expanded = expand_query(query)
+        if not expanded:
+            return exact_keywords, False, "exact"
+        return expanded, True, "semantic"
+    except Exception:
+        app.logger.warning(
+            "Semantic query expansion failed; falling back to exact search"
+        )
+        return exact_keywords, False, "exact"
+
+
+def _build_search_verification(matched_doc_ids, search_terms, user_id, role):
+    """Build a scoped Merkle manifest and proofs from trusted keyword records."""
+    db = get_db()
+    config = db.execute(
+        "SELECT key_version FROM cube_config WHERE id = 1"
+    ).fetchone()
+    if config is None:
+        raise SearchIndexRecoveryError("Search-key state is not initialized")
+    key_version = config["key_version"]
+    user_scope = "all" if role == "admin" else user_id
+    rows = db.execute(
+        """
+        SELECT d.owner, d.id AS document_id, k.keyword
+        FROM documents d
+        JOIN keywords k ON k.document_id = d.id
+        WHERE (? = 1 OR d.owner = ?)
+        ORDER BY d.owner, d.id, k.id
+        """,
+        (int(role == "admin"), user_id),
+    ).fetchall()
+    leaf_by_document_keyword = {}
+    leaves = []
+    for row in rows:
+        keyword = normalize_keyword(row["keyword"])
+        if not keyword:
+            continue
+        leaves.append([row["owner"], keyword, row["document_id"], key_version])
+        leaf_by_document_keyword.setdefault(row["document_id"], set()).add(keyword)
+
+    tree = MerkleTree(leaves)
+    manifest = signed_manifest(
+        tree, VERIFICATION_SIGNING_KEY, key_version, user_scope
+    )
+    term_matches = {
+        normalize_keyword(term): set(cube_index.search_single_keyword(term))
+        for term in search_terms
+    }
+    proofs = []
+    for document_id in matched_doc_ids:
+        document = db.execute(
+            "SELECT owner FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        if document is None or (
+            role != "admin" and document["owner"] != user_id
+        ):
+            continue
+        for keyword, term_document_ids in term_matches.items():
+            if (
+                document_id in term_document_ids
+                and keyword in leaf_by_document_keyword.get(document_id, set())
+            ):
+                leaf = [
+                    document["owner"],
+                    keyword,
+                    document_id,
+                    key_version,
+                ]
+                proof = tree.proof_for(leaf)
+                proof["result_id"] = document_id
+                proofs.append(proof)
+    manifest["proofs"] = proofs
+    return manifest
+
+
+def _search_terms(terms: list[str], user_id=None, semantic=False) -> list[int]:
+    if not cube_index:
+        return []
+    if not semantic:
+        return search_document_ids(terms, user_id)
+
+    matched_ids = set()
+    for term in terms:
+        matched_ids.update(search_document_ids([term], user_id))
+    return sorted(matched_ids)
+
+
+def ensure_search_index_trustworthy() -> bool:
+    """Authenticate key metadata and all CUBE rows; recover on any mismatch."""
+    global SEARCH_KEY, cube_index
+
+    with key_lifecycle_lock:
+        db = get_db()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM cube_config WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                raise SearchIndexRecoveryError(
+                    "Search-key state is not initialized"
+                )
+            version = row["key_version"]
+            key_status = row["key_status"]
+            version_valid = isinstance(version, int) and version >= 1
+            key_path = _key_file_path(version) if version_valid else ""
+            try:
+                if key_path:
+                    with open(key_path, "rb") as key_file:
+                        disk_key = key_file.read()
+                else:
+                    disk_key = b""
+            except OSError:
+                disk_key = b""
+            if version_valid and len(disk_key) == 32:
+                SEARCH_KEY = disk_key
+                cube_index = CUBEIndex(get_db, disk_key, key_version=version)
+            key_matches = (
+                len(disk_key) == 32
+                and hmac.compare_digest(
+                    hashlib.sha256(disk_key).hexdigest(),
+                    row["search_key_hash"] or "",
+                )
+            )
+            try:
+                expected_index_mac = _index_integrity_tag(db, SEARCH_KEY)
+                index_matches = hmac.compare_digest(
+                    expected_index_mac, row["index_mac"] or ""
+                )
+                state_matches = hmac.compare_digest(
+                    _state_integrity_tag(row, SEARCH_KEY), row["state_mac"] or ""
+                )
+                version_matches = version_valid and all(
+                    db.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE key_version != ?",
+                        (version,),
+                    ).fetchone()[0] == 0
+                    for table in ("cube_lcic", "cube_hki", "cube_vkic", "cube_dic")
+                )
+            except (TypeError, ValueError, sqlite3.Error):
+                index_matches = state_matches = version_matches = False
+            if (
+                version_valid
+                and key_status == "ACTIVE"
+                and key_matches
+                and index_matches
+                and state_matches
+                and version_matches
+            ):
+                db.rollback()
+                return False
+
+            db.execute(
+                """
+                UPDATE cube_config
+                SET key_status = 'COMPROMISED'
+                WHERE id = 1
+                """
+            )
+            _write_state_mac(db, SEARCH_KEY)
+            _record_lifecycle_event(
+                db,
+                "COMPROMISE_DETECTED",
+                "DETECTED",
+                version if isinstance(version, int) else None,
+                version if isinstance(version, int) else None,
+                "Authenticated key or CUBE state validation failed",
+            )
+            db.commit()
+        except SearchIndexRecoveryError:
+            if db.in_transaction:
+                db.rollback()
+            raise
+        except sqlite3.Error as exc:
+            if db.in_transaction:
+                db.rollback()
+            app.logger.exception("Could not validate search-index integrity")
+            raise SearchIndexRecoveryError(
+                "Search-index integrity could not be validated"
+            ) from exc
+        rotate_search_key(recovery=True)
+        return True
 
 
 def ensure_directories():
@@ -98,8 +761,8 @@ def close_db(error=None):
 
 
 def create_tables():
-    global cube_index, performance_tracker
-    
+    global cube_index, performance_tracker, SEARCH_KEY
+
     db = get_db()
     db.execute(
         "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT)"
@@ -111,18 +774,139 @@ def create_tables():
         "CREATE TABLE IF NOT EXISTS keywords (id INTEGER PRIMARY KEY AUTOINCREMENT, document_id INTEGER, keyword TEXT, FOREIGN KEY(document_id) REFERENCES documents(id))"
     )
     db.commit()
-    
-    # Review 2: Initialize CUBE index and performance tracker with get_db callable
-    # This ensures thread-safe database access in Flask's multi-threaded environment
+
     cube_index = CUBEIndex(get_db, SEARCH_KEY)
     cube_index.create_tables()
-    
     performance_tracker = PerformanceTracker(get_db)
     performance_tracker.create_tables()
 
+    config_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(cube_config)").fetchall()
+    }
+    had_lifecycle_state = "key_version" in config_columns
+    lifecycle_columns = {
+        "key_version": "INTEGER NOT NULL DEFAULT 1",
+        "key_status": "TEXT NOT NULL DEFAULT 'ACTIVE'",
+        "index_mac": "TEXT",
+        "state_mac": "TEXT",
+        "last_rotation_at": "TEXT",
+        "last_recovery_at": "TEXT",
+        "last_reconstruction_status": "TEXT",
+        "last_reconstruction_at": "TEXT",
+    }
+    for column, definition in lifecycle_columns.items():
+        if column not in config_columns:
+            db.execute(f"ALTER TABLE cube_config ADD COLUMN {column} {definition}")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS key_lifecycle_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            from_version INTEGER,
+            to_version INTEGER,
+            occurred_at TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+    if not had_lifecycle_state:
+        key_path = _key_file_path(1)
+        if os.path.isfile(key_path):
+            with open(key_path, "rb") as key_file:
+                persisted_key = key_file.read()
+            if len(persisted_key) == 32:
+                SEARCH_KEY = persisted_key
+        cube_index = CUBEIndex(get_db, SEARCH_KEY, key_version=1)
+        cube_index.create_tables()
+        current_key_hash = hashlib.sha256(SEARCH_KEY).hexdigest()
+        db.execute("BEGIN IMMEDIATE")
+        for table in ("cube_hki", "cube_vkic", "cube_dic", "cube_lcic"):
+            db.execute(f"DELETE FROM {table}")
+        grouped = {}
+        for row in db.execute(
+            """
+            SELECT d.id AS document_id, k.keyword
+            FROM documents d JOIN keywords k ON k.document_id = d.id
+            ORDER BY d.id, k.id
+            """
+        ).fetchall():
+            grouped.setdefault(row["document_id"], []).append(
+                row["keyword"].lower()
+            )
+        for document_id, keywords in grouped.items():
+            cube_index.add_document_index(
+                document_id,
+                list(dict.fromkeys(keywords)),
+                _utc_now_iso(),
+                commit=False,
+            )
+        _verify_reconstructed_index(cube_index, db)
+        now = _utc_now_iso()
+        db.execute(
+            """
+            INSERT INTO cube_config
+            (id, search_key_hash, created_at, key_version, key_status,
+             index_mac, state_mac, last_rotation_at, last_recovery_at,
+             last_reconstruction_status, last_reconstruction_at)
+            VALUES (1, ?, ?, 1, 'ACTIVE', '', '', NULL, NULL, 'SUCCESS', ?)
+            ON CONFLICT(id) DO UPDATE SET
+                search_key_hash = excluded.search_key_hash,
+                key_version = 1,
+                key_status = 'ACTIVE',
+                last_reconstruction_status = 'SUCCESS',
+                last_reconstruction_at = excluded.last_reconstruction_at
+            """,
+            (current_key_hash, now, now),
+        )
+        db.commit()
+        if not os.path.isfile(key_path):
+            _store_versioned_key(1, SEARCH_KEY)
+        _refresh_index_integrity(db)
+        db.commit()
+    else:
+        config = db.execute("SELECT * FROM cube_config WHERE id = 1").fetchone()
+        if config is None:
+            raise SearchIndexRecoveryError("Search-key state is missing")
+        version = config["key_version"]
+        if not isinstance(version, int) or version < 1:
+            version = 0
+        key_path = _key_file_path(version) if version else ""
+        if key_path and os.path.isfile(key_path):
+            with open(key_path, "rb") as key_file:
+                persisted_key = key_file.read()
+            if len(persisted_key) == 32:
+                SEARCH_KEY = persisted_key
+        cube_index = CUBEIndex(
+            get_db, SEARCH_KEY, key_version=version if version > 0 else 1
+        )
+
+    legacy_key_path = os.path.join(INSTANCE_FOLDER, "search_key")
+    active_key_path = _key_file_path(cube_index.key_version)
+    if os.path.isfile(active_key_path) and os.path.isfile(legacy_key_path):
+        try:
+            os.remove(legacy_key_path)
+        except OSError:
+            app.logger.exception("Could not remove the legacy search-key file")
+
+    if had_lifecycle_state:
+        ensure_search_index_trustworthy()
+
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return generate_password_hash(password)
+
+
+def verify_password(stored_password: str, password: str) -> tuple[bool, bool]:
+    """Return whether a password matches and whether the hash needs upgrading."""
+    if re.fullmatch(r"[0-9a-fA-F]{64}", stored_password or ""):
+        legacy_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return (hmac.compare_digest(stored_password, legacy_hash), True)
+    try:
+        return (check_password_hash(stored_password, password), False)
+    except (TypeError, ValueError):
+        return (False, False)
 
 
 def allowed_file(filename: str) -> bool:
@@ -227,10 +1011,77 @@ def decrypt_bytes(encrypted_bytes: bytes, key_b64: str) -> bytes:
     return cipher.decrypt_and_verify(ciphertext, tag)
 
 
+def cleanup_legacy_plaintext_uploads() -> None:
+    """Remove only old staging files proven to duplicate a stored encrypted file."""
+    upload_folder = app.config["UPLOAD_FOLDER"]
+    encrypted_folder = app.config["ENCRYPTED_FOLDER"]
+    db = get_db()
+    cutoff = time.time() - 24 * 60 * 60
+
+    for staged_name in os.listdir(upload_folder):
+        staged_path = os.path.join(upload_folder, staged_name)
+        try:
+            if not os.path.isfile(staged_path):
+                continue
+            if staged_name.startswith(".staging-"):
+                if os.path.getmtime(staged_path) <= cutoff:
+                    os.remove(staged_path)
+                continue
+        except OSError:
+            app.logger.exception("Could not inspect a legacy plaintext staging file")
+            continue
+
+        match = re.fullmatch(r"[0-9a-fA-F]{32}_(.+)", staged_name)
+        if not match:
+            continue
+        filename = match.group(1)
+        records = db.execute(
+            """
+            SELECT encrypted_path, aes_key FROM documents
+            WHERE filename = ? AND encrypted_path IS NOT NULL
+            """,
+            (filename,),
+        ).fetchall()
+        try:
+            with open(staged_path, "rb") as staged_file:
+                staged_digest = hashlib.sha256(staged_file.read()).digest()
+            duplicate_found = False
+            for record in records:
+                encrypted_name = record["encrypted_path"]
+                if os.path.basename(encrypted_name) != encrypted_name:
+                    continue
+                encrypted_path = os.path.join(encrypted_folder, encrypted_name)
+                if not os.path.isfile(encrypted_path):
+                    continue
+                with open(encrypted_path, "rb") as encrypted_file:
+                    plaintext = decrypt_bytes(encrypted_file.read(), record["aes_key"])
+                if hmac.compare_digest(
+                    staged_digest, hashlib.sha256(plaintext).digest()
+                ):
+                    duplicate_found = True
+                    break
+            if duplicate_found:
+                os.remove(staged_path)
+        except (OSError, ValueError, TypeError):
+            app.logger.exception(
+                "Could not verify or remove a legacy plaintext staging file"
+            )
+
+
 def login_required(view):
     def wrapped_view(**kwargs):
         if "user_id" not in session:
             return redirect(url_for("login"))
+        return view(**kwargs)
+    wrapped_view.__name__ = view.__name__
+    return wrapped_view
+
+
+def admin_required(view):
+    @login_required
+    def wrapped_view(**kwargs):
+        if session.get("role") != "admin":
+            return "Forbidden", 403
         return view(**kwargs)
     wrapped_view.__name__ = view.__name__
     return wrapped_view
@@ -248,7 +1099,8 @@ def register():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        role = request.form.get("role", "student")
+        requested_role = request.form.get("role", "student")
+        role = requested_role if requested_role in {"student", "doctor"} else "student"
 
         if not username or not password:
             flash("Please provide both username and password.", "warning")
@@ -279,7 +1131,19 @@ def login():
             "SELECT * FROM users WHERE username = ?",
             (username,),
         ).fetchone()
-        if user and user["password"] == hash_password(password):
+        if user:
+            password_matches, needs_upgrade = verify_password(
+                user["password"], password
+            )
+        else:
+            password_matches, needs_upgrade = False, False
+        if user and password_matches:
+            if needs_upgrade:
+                db.execute(
+                    "UPDATE users SET password = ? WHERE id = ?",
+                    (hash_password(password), user["id"]),
+                )
+                db.commit()
             session.clear()
             session["user_id"] = user["id"]
             session["username"] = user["username"]
@@ -301,7 +1165,12 @@ def logout():
 @login_required
 def dashboard():
     global cube_index
-    
+    try:
+        ensure_search_index_trustworthy()
+    except SearchIndexRecoveryError:
+        app.logger.exception("Search-index recovery failed while loading dashboard")
+        flash("Search is temporarily unavailable while index recovery is attempted.", "danger")
+
     db = get_db()
     user_id = session["user_id"]
     role = session.get("role")
@@ -318,7 +1187,9 @@ def dashboard():
     # Review 2: Get CUBE statistics
     cube_stats = {}
     if cube_index:
-        cube_stats = cube_index.get_cube_stats()
+        cube_stats = cube_index.get_cube_stats(
+            None if role == "admin" else user_id
+        )
     
     return render_template(
         "dashboard.html",
@@ -331,7 +1202,14 @@ def dashboard():
 @login_required
 def upload():
     global cube_index, performance_tracker
-    
+
+    try:
+        ensure_search_index_trustworthy()
+    except SearchIndexRecoveryError:
+        app.logger.exception("Search-index recovery failed before document upload")
+        flash("Document upload is unavailable while index recovery is attempted.", "danger")
+        return redirect(url_for("dashboard"))
+
     if request.method == "POST":
         file = request.files.get("document")
         if not file or file.filename == "":
@@ -343,62 +1221,98 @@ def upload():
             return redirect(request.url)
 
         filename = secure_filename(file.filename)
-        unique_name = f"{uuid4().hex}_{filename}"
+        unique_name = f".staging-{uuid4().hex}_{filename}"
         upload_path = os.path.join(app.config["UPLOAD_FOLDER"], unique_name)
-        file.save(upload_path)
-
-        extracted_text = extract_text(upload_path)
-        keywords = extract_keywords(extracted_text)
-        
-        # Review 2: Measure encryption time
-        enc_start = time.time()
         encrypted_name = f"{uuid4().hex}_{filename}.enc"
         encrypted_path = os.path.join(app.config["ENCRYPTED_FOLDER"], encrypted_name)
-        aes_key = encrypt_file(upload_path, encrypted_path)
-        enc_duration_ms = (time.time() - enc_start) * 1000
-        
-        if performance_tracker:
-            performance_tracker.log_operation('encryption', enc_duration_ms, filename)
-
         db = get_db()
-        cursor = db.execute(
-            "INSERT INTO documents (filename, owner, upload_date, encrypted_path, aes_key) VALUES (?, ?, ?, ?, ?)",
-            (
-                filename,
-                session["user_id"],
-                datetime.datetime.utcnow().isoformat(),
-                encrypted_name,
-                aes_key,
-            ),
-        )
-        document_id = cursor.lastrowid
-        db.executemany(
-            "INSERT INTO keywords (document_id, keyword) VALUES (?, ?)",
-            [(document_id, kw) for kw in keywords],
-        )
-        db.commit()
-        
-        # Review 2: Build CUBE index for searchable encryption
-        if cube_index:
-            cube_start = time.time()
-            lcic, hki, vkic, dic = cube_index.add_document_index(
-                document_id, 
-                keywords, 
-                datetime.datetime.utcnow().isoformat()
+        upload_succeeded = False
+        plaintext_cleanup_failed = False
+        try:
+            file.save(upload_path)
+            extracted_text = extract_text(upload_path)
+            keywords = extract_keywords(extracted_text)
+
+            enc_start = time.time()
+            aes_key = encrypt_file(upload_path, encrypted_path)
+            enc_duration_ms = (time.time() - enc_start) * 1000
+
+            cursor = db.execute(
+                "INSERT INTO documents (filename, owner, upload_date, encrypted_path, aes_key) VALUES (?, ?, ?, ?, ?)",
+                (
+                    filename,
+                    session["user_id"],
+                    datetime.datetime.utcnow().isoformat(),
+                    encrypted_name,
+                    aes_key,
+                ),
             )
-            cube_duration_ms = (time.time() - cube_start) * 1000
-            
-            if performance_tracker:
-                performance_tracker.log_operation(
-                    'cube_index_update', 
-                    cube_duration_ms, 
-                    f"doc={document_id},keywords={len(keywords)}"
+            document_id = cursor.lastrowid
+            db.executemany(
+                "INSERT INTO keywords (document_id, keyword) VALUES (?, ?)",
+                [(document_id, kw) for kw in keywords],
+            )
+            if cube_index:
+                cube_start = time.time()
+                cube_index.add_document_index(
+                    document_id,
+                    keywords,
+                    datetime.datetime.utcnow().isoformat(),
+                    commit=False,
                 )
-            
+                cube_duration_ms = (time.time() - cube_start) * 1000
+            _refresh_index_integrity(db)
+            db.commit()
+            upload_succeeded = True
+        except Exception:
+            db.rollback()
+            if os.path.exists(encrypted_path):
+                try:
+                    os.remove(encrypted_path)
+                except OSError:
+                    app.logger.exception("Could not remove failed encrypted upload")
+            raise
+        finally:
+            try:
+                if os.path.exists(upload_path):
+                    os.remove(upload_path)
+            except OSError:
+                plaintext_cleanup_failed = True
+                app.logger.exception("Could not remove temporary plaintext upload")
+
+        performance_logging_failed = False
+        if upload_succeeded and performance_tracker:
+            try:
+                performance_tracker.log_operation(
+                    "encryption", enc_duration_ms, filename, session["user_id"]
+                )
+                if cube_index:
+                    performance_tracker.log_operation(
+                        "cube_index_update",
+                        cube_duration_ms,
+                        f"doc={document_id},keywords={len(keywords)}",
+                        session["user_id"],
+                    )
+            except sqlite3.Error:
+                performance_logging_failed = True
+                app.logger.exception("Could not record document upload performance")
+        if plaintext_cleanup_failed:
+            flash(
+                "Document was encrypted, but its temporary plaintext file could not "
+                "be removed. Contact the administrator to remove the leftover file.",
+                "warning",
+            )
+        elif performance_logging_failed:
+            flash(
+                "Document was uploaded and encrypted, but its performance metrics "
+                "could not be recorded.",
+                "warning",
+            )
+        elif cube_index:
             flash(
                 f"Document uploaded and encrypted successfully. "
                 f"CUBE index updated: {len(keywords)} keywords indexed.",
-                "success"
+                "success",
             )
         else:
             flash("Document uploaded and encrypted successfully.", "success")
@@ -440,7 +1354,9 @@ def document_detail(document_id):
         flash("You do not have permission to view this document.", "danger")
         return redirect(url_for("dashboard"))
 
-    encrypted_path = os.path.join(app.config["ENCRYPTED_FOLDER"], document["encrypted_path"])
+    encrypted_path = os.path.join(
+        app.config["ENCRYPTED_FOLDER"], document["encrypted_path"]
+    )
     extracted_text = ""
     if os.path.exists(encrypted_path):
         try:
@@ -456,7 +1372,12 @@ def document_detail(document_id):
     ).fetchall()
     return render_template(
         "document_detail.html",
-        document=document,
+        document={
+            "id": document["id"],
+            "filename": document["filename"],
+            "owner": document["owner"],
+            "upload_date": document["upload_date"],
+        },
         keywords=[row["keyword"] for row in keywords],
         extracted_text=extracted_text,
     )
@@ -510,9 +1431,17 @@ def search():
         if not keywords:
             flash("Invalid search query.", "warning")
             return render_template("search.html", query=query)
-        
-        # Redirect to results page
-        return redirect(url_for("search_results", query=query))
+
+        semantic_enabled = request.form.get("semantic_search") == "true"
+        verification_enabled = request.form.get("verify_search") == "true"
+        return redirect(
+            url_for(
+                "search_results",
+                query=query,
+                semantic="true" if semantic_enabled else "false",
+                verify="true" if verification_enabled else "false",
+            )
+        )
     
     return render_template("search.html", query="")
 
@@ -524,12 +1453,18 @@ def search_results():
     global cube_index, performance_tracker
     
     query = request.args.get("query", "").strip()
+    verification_requested = request.args.get("verify") == "true"
     if not query:
         return redirect(url_for("search"))
     
     # Parse keywords from query
-    keywords = [kw.strip().lower() for kw in re.split(r'\s+AND\s+|\s+and\s+', query)]
-    keywords = [kw for kw in keywords if kw]
+    keywords = _parse_search_keywords(query)
+    semantic_requested = request.args.get("semantic") == "true"
+    search_terms = keywords
+    semantic_used = False
+    search_mode = "conjunctive" if len(keywords) > 1 else "exact"
+    if semantic_requested and keywords:
+        search_terms, semantic_used, search_mode = _expand_search_terms(query, keywords)
     
     if not keywords or not cube_index:
         return render_template(
@@ -543,30 +1478,39 @@ def search_results():
     
     # Perform search
     search_start = time.time()
+    search_succeeded = False
+    role = session.get("role")
+    user_id = session["user_id"]
     try:
-        matched_doc_ids = cube_index.search_conjunctive(keywords)
-    except Exception as e:
-        flash(f"Search error: {str(e)}", "danger")
+        ensure_search_index_trustworthy()
+        db = get_db()
+        matched_doc_ids = _search_terms(
+            search_terms,
+            None if role == "admin" else user_id,
+            semantic=semantic_used,
+        )
+        search_succeeded = True
+    except Exception:
+        app.logger.exception("Search failed")
+        flash("Search failed; no results were returned.", "danger")
         matched_doc_ids = []
     
     search_duration_ms = (time.time() - search_start) * 1000
     
     # Log search if performance tracker available
+    db = get_db()
+
     if performance_tracker:
         performance_tracker.log_search(
-            session["user_id"],
+            user_id,
             query,
-            len(keywords),
+            len(search_terms),
             len(matched_doc_ids),
             search_duration_ms,
-            'conjunctive' if len(keywords) > 1 else 'single'
+            search_mode,
         )
     
     # Fetch matched documents (respect access control)
-    db = get_db()
-    user_id = session["user_id"]
-    role = session.get("role")
-    
     results = []
     for doc_id in matched_doc_ids:
         doc = db.execute(
@@ -577,7 +1521,7 @@ def search_results():
         if doc and (doc["owner"] == user_id or role == "admin"):
             # Get matched keywords from CUBE
             matched_keywords = []
-            for kw in keywords:
+            for kw in search_terms:
                 kw_results = db.execute(
                     "SELECT keyword FROM keywords WHERE document_id = ? AND keyword LIKE ?",
                     (doc_id, f"%{kw}%")
@@ -591,7 +1535,23 @@ def search_results():
                 'upload_date': doc['upload_date'],
                 'matched_keywords': list(set(matched_keywords))
             })
-    
+
+    verification_bundle = None
+    if verification_requested and search_succeeded:
+        try:
+            verification_bundle = _build_search_verification(
+                matched_doc_ids, search_terms, user_id, role
+            )
+            proofs_by_document = {}
+            for proof in verification_bundle["proofs"]:
+                proofs_by_document.setdefault(proof["result_id"], []).append(proof)
+            for result in results:
+                result["verification_proofs"] = proofs_by_document.get(
+                    result["id"], []
+                )
+        except Exception:
+            app.logger.exception("Could not create search-result verification data")
+
     return render_template(
         "search_results.html",
         query=query,
@@ -599,7 +1559,15 @@ def search_results():
         results=results,
         result_count=len(results),
         search_time_ms=round(search_duration_ms, 2),
-        search_type='conjunctive' if len(keywords) > 1 else 'single'
+        search_type=search_mode,
+        semantic_enabled=semantic_requested,
+        semantic_used=semantic_used,
+        expanded_terms=search_terms if semantic_used else [],
+        verification_requested=verification_requested,
+        verification_bundle=verification_bundle,
+        verification_expected_user_id=(
+            None if role == "admin" else user_id
+        ),
     )
 
 
@@ -609,43 +1577,83 @@ def api_search():
     """API endpoint for search requests."""
     global cube_index, performance_tracker
     
-    data = request.get_json()
-    query = data.get("query", "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("query"), str):
+        return jsonify({"error": "A JSON object with a string query is required"}), 400
+    query = data["query"].strip()
+    semantic_value = data.get("semantic", False)
+    if not isinstance(semantic_value, bool):
+        return jsonify({"error": "semantic must be a boolean"}), 400
+    semantic_requested = semantic_value
+    verification_requested = data.get("verify", False)
+    if not isinstance(verification_requested, bool):
+        return jsonify({"error": "verify must be a boolean"}), 400
     
     if not query or not cube_index:
         return jsonify({'error': 'Invalid query or search unavailable'}), 400
     
     # Parse keywords
-    keywords = [kw.strip().lower() for kw in re.split(r'\s+AND\s+|\s+and\s+', query)]
-    keywords = [kw for kw in keywords if kw]
+    keywords = _parse_search_keywords(query)
+    if not keywords:
+        return jsonify({"error": "A non-empty search query is required"}), 400
+    search_terms = keywords
+    semantic_used = False
+    search_mode = "conjunctive" if len(keywords) > 1 else "exact"
+    if semantic_requested:
+        search_terms, semantic_used, search_mode = _expand_search_terms(
+            query, keywords
+        )
     
     # Perform search
     search_start = time.time()
     try:
-        matched_doc_ids = cube_index.search_conjunctive(keywords)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        ensure_search_index_trustworthy()
+        user_id = session["user_id"]
+        role = session.get("role")
+        matched_doc_ids = _search_terms(
+            search_terms,
+            None if role == "admin" else user_id,
+            semantic=semantic_used,
+        )
+    except Exception:
+        app.logger.exception("API search failed")
+        return jsonify({"error": "Search is temporarily unavailable"}), 500
     
     search_duration_ms = (time.time() - search_start) * 1000
     
-    # Log search
+    # Log only results visible to this user.
     if performance_tracker:
         performance_tracker.log_search(
-            session["user_id"],
+            user_id,
             query,
-            len(keywords),
+            len(search_terms),
             len(matched_doc_ids),
             search_duration_ms,
-            'conjunctive' if len(keywords) > 1 else 'single'
+            search_mode,
         )
     
-    return jsonify({
+    response_data = {
         'query': query,
         'keywords': keywords,
+        'semantic_enabled': semantic_requested,
+        'semantic_used': semantic_used,
+        'expanded_terms': search_terms if semantic_used else [],
+        'search_mode': search_mode,
         'matched_document_ids': matched_doc_ids,
         'result_count': len(matched_doc_ids),
         'search_time_ms': round(search_duration_ms, 2)
-    })
+    }
+    if verification_requested:
+        try:
+            response_data["verification"] = _build_search_verification(
+                matched_doc_ids, search_terms, user_id, role
+            )
+        except Exception:
+            app.logger.exception("Could not create API search verification data")
+            return jsonify(
+                {"error": "Search verification is temporarily unavailable"}
+            ), 500
+    return jsonify(response_data)
 
 
 @app.route("/cube-dashboard")
@@ -653,19 +1661,70 @@ def api_search():
 def cube_dashboard():
     """Visualize CUBE index structure and statistics."""
     global cube_index
+
+    try:
+        ensure_search_index_trustworthy()
+    except SearchIndexRecoveryError:
+        app.logger.exception("Search-index recovery failed before CUBE dashboard")
+        flash("CUBE status is temporarily unavailable.", "danger")
+        return redirect(url_for("dashboard"))
     
     if not cube_index:
         cube_stats = {}
         keyword_mappings = []
     else:
-        cube_stats = cube_index.get_cube_stats()
-        keyword_mappings = cube_index.get_keyword_mappings(limit=50)
+        user_id = None if session.get("role") == "admin" else session["user_id"]
+        cube_stats = cube_index.get_cube_stats(user_id=user_id)
+        keyword_mappings = cube_index.get_keyword_mappings(
+            limit=50, user_id=user_id
+        )
     
     return render_template(
         "cube_visualization.html",
         cube_stats=cube_stats,
         keyword_mappings=keyword_mappings
     )
+
+
+@app.route("/admin/key-status", methods=["GET"])
+@admin_required
+def admin_key_status():
+    try:
+        ensure_search_index_trustworthy()
+    except SearchIndexRecoveryError:
+        app.logger.exception("Automatic search-index recovery failed")
+        flash("Recovery failed. The current index was not activated.", "danger")
+    state = get_db().execute(
+        """
+        SELECT key_version, key_status, last_rotation_at, last_recovery_at,
+               last_reconstruction_status, last_reconstruction_at
+        FROM cube_config WHERE id = 1
+        """
+    ).fetchone()
+    events = get_db().execute(
+        """
+        SELECT event_type, status, from_version, to_version, occurred_at
+        FROM key_lifecycle_events ORDER BY id DESC LIMIT 20
+        """
+    ).fetchall()
+    return render_template(
+        "admin_key_status.html", state=state, events=events
+    )
+
+
+@app.route("/admin/key-status/recover", methods=["POST"])
+@admin_required
+def admin_recover_search_index():
+    try:
+        new_version = rotate_search_key(recovery=True, force=True)
+    except SearchIndexRecoveryError:
+        flash("Recovery failed. The current index was not activated.", "danger")
+    else:
+        flash(
+            f"Search index recovered and key version advanced to {new_version}.",
+            "success",
+        )
+    return redirect(url_for("admin_key_status"))
 
 
 @app.route("/performance")
@@ -678,8 +1737,11 @@ def performance():
     recent_searches = []
     
     if performance_tracker:
-        perf_summary = performance_tracker.get_performance_summary()
-        recent_searches = performance_tracker.get_search_stats(limit=20)
+        user_id = None if session.get("role") == "admin" else session["user_id"]
+        perf_summary = performance_tracker.get_performance_summary(user_id=user_id)
+        recent_searches = performance_tracker.get_search_stats(
+            limit=20, user_id=user_id
+        )
     
     return render_template(
         "performance.html",
@@ -693,6 +1755,13 @@ def performance():
 def delete_document(document_id):
     """Delete document and remove from CUBE index."""
     global cube_index, performance_tracker
+
+    try:
+        ensure_search_index_trustworthy()
+    except SearchIndexRecoveryError:
+        app.logger.exception("Search-index recovery failed before document deletion")
+        flash("Document deletion is unavailable while index recovery is attempted.", "danger")
+        return redirect(url_for("dashboard"))
     
     db = get_db()
     document = db.execute(
@@ -709,41 +1778,83 @@ def delete_document(document_id):
         flash("You do not have permission to delete this document.", "danger")
         return redirect(url_for("dashboard"))
     
-    # Delete from CUBE index first (backward privacy)
-    if cube_index:
-        del_start = time.time()
-        lcic_aff, hki_del, vkic_inv, dic_del = cube_index.remove_document_index(
-            document_id,
-            datetime.datetime.utcnow().isoformat()
-        )
-        del_duration_ms = (time.time() - del_start) * 1000
-        
-        if performance_tracker:
-            performance_tracker.log_operation(
-                'cube_index_deletion',
-                del_duration_ms,
-                f"doc={document_id},entries_removed={hki_del+dic_del}"
-            )
-    
-    # Delete encrypted file
-    encrypted_path = os.path.join(app.config["ENCRYPTED_FOLDER"], document["encrypted_path"])
+    encrypted_path = os.path.join(
+        app.config["ENCRYPTED_FOLDER"], document["encrypted_path"]
+    )
+    quarantine_path = None
     if os.path.exists(encrypted_path):
+        quarantine_path = f"{encrypted_path}.deleting-{uuid4().hex}"
         try:
-            os.remove(encrypted_path)
-        except Exception as e:
-            flash(f"Warning: Could not delete encrypted file: {str(e)}", "warning")
-    
-    # Delete from database
-    db.execute("DELETE FROM keywords WHERE document_id = ?", (document_id,))
-    db.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-    db.commit()
-    
-    flash("Document deleted successfully and removed from CUBE index.", "success")
+            os.replace(encrypted_path, quarantine_path)
+        except OSError:
+            app.logger.exception("Could not stage encrypted document for deletion")
+            flash("Document deletion failed; the document was not removed.", "danger")
+            return redirect(url_for("dashboard"))
+
+    try:
+        del_start = time.time()
+        if cube_index:
+            cube_index.remove_document_index(
+                document_id,
+                datetime.datetime.utcnow().isoformat(),
+                commit=False,
+            )
+        db.execute("DELETE FROM keywords WHERE document_id = ?", (document_id,))
+        db.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+        _refresh_index_integrity(db)
+        db.commit()
+        del_duration_ms = (time.time() - del_start) * 1000
+    except Exception:
+        db.rollback()
+        restoration_failed = False
+        if quarantine_path and os.path.exists(quarantine_path):
+            try:
+                os.replace(quarantine_path, encrypted_path)
+            except OSError:
+                restoration_failed = True
+                app.logger.exception("Could not restore encrypted document after deletion failure")
+        app.logger.exception("Document deletion transaction failed")
+        if restoration_failed:
+            flash(
+                "Deletion failed and the encrypted file could not be restored. "
+                "The document record remains, but administrator recovery is required.",
+                "danger",
+            )
+        else:
+            flash("Document deletion failed; the document was not removed.", "danger")
+        return redirect(url_for("dashboard"))
+
+    if quarantine_path:
+        try:
+            os.remove(quarantine_path)
+        except OSError:
+            app.logger.exception("Could not remove quarantined encrypted document")
+            flash(
+                "The document record was removed, but encrypted-file cleanup failed. "
+                "An administrator must remove the quarantined file.",
+                "danger",
+            )
+            return redirect(url_for("dashboard"))
+
+    if performance_tracker:
+        try:
+            performance_tracker.log_operation(
+                "cube_index_deletion",
+                del_duration_ms,
+                f"doc={document_id}",
+                session["user_id"],
+            )
+        except sqlite3.Error:
+            app.logger.exception("Could not record document deletion performance")
+    flash("Document deleted successfully.", "success")
     return redirect(url_for("dashboard"))
 
 
+ensure_directories()
+with app.app_context():
+    create_tables()
+    cleanup_legacy_plaintext_uploads()
+
+
 if __name__ == "__main__":
-    ensure_directories()
-    with app.app_context():
-        create_tables()
-    app.run(debug=True)
+    app.run(debug=False)

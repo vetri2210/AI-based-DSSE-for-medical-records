@@ -46,10 +46,16 @@ class PerformanceTracker:
                 operation TEXT NOT NULL,
                 duration_ms REAL NOT NULL,
                 details TEXT,
+                user_id INTEGER,
                 timestamp TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )
         ''')
+
+        cursor.execute("PRAGMA table_info(performance_log)")
+        performance_columns = {row[1] for row in cursor.fetchall()}
+        if "user_id" not in performance_columns:
+            cursor.execute("ALTER TABLE performance_log ADD COLUMN user_id INTEGER")
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS search_log (
@@ -84,7 +90,13 @@ class PerformanceTracker:
             duration_ms = (time.time() - start_time) * 1000
             self.log_operation(operation_name, duration_ms, details)
     
-    def log_operation(self, operation: str, duration_ms: float, details: Optional[str] = None):
+    def log_operation(
+        self,
+        operation: str,
+        duration_ms: float,
+        details: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ):
         """Log an operation's performance."""
         from datetime import datetime
         timestamp = datetime.utcnow().isoformat()
@@ -93,9 +105,9 @@ class PerformanceTracker:
         cursor = db.cursor()
         cursor.execute('''
             INSERT INTO performance_log 
-            (operation, duration_ms, details, timestamp, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (operation, duration_ms, details, timestamp, timestamp))
+            (operation, duration_ms, details, user_id, timestamp, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (operation, duration_ms, details, user_id, timestamp, timestamp))
         db.commit()
         
         self._current_measurements[operation] = {
@@ -118,17 +130,22 @@ class PerformanceTracker:
         ''', (user_id, query, keyword_count, result_count, duration_ms, search_type, timestamp, timestamp))
         db.commit()
     
-    def get_operation_stats(self, operation: str, limit: int = 100) -> list:
+    def get_operation_stats(
+        self, operation: str, limit: int = 100, user_id: Optional[int] = None
+    ) -> list:
         """Get performance stats for a specific operation."""
         db = self.db_getter()
         cursor = db.cursor()
-        cursor.execute('''
+        user_filter = '' if user_id is None else ' AND user_id = ?'
+        parameters = (operation, limit) if user_id is None else (operation, user_id, limit)
+        cursor.execute(f'''
             SELECT duration_ms, timestamp, details 
             FROM performance_log
             WHERE operation = ?
+            {user_filter}
             ORDER BY created_at DESC
             LIMIT ?
-        ''', (operation, limit))
+        ''', parameters)
         
         stats = [
             {
@@ -151,16 +168,21 @@ class PerformanceTracker:
             }
         return {'operation': operation, 'samples': 0}
     
-    def get_search_stats(self, limit: int = 50) -> list:
+    def get_search_stats(
+        self, limit: int = 50, user_id: Optional[int] = None
+    ) -> list:
         """Get recent search statistics."""
         db = self.db_getter()
         cursor = db.cursor()
-        cursor.execute('''
+        user_filter = '' if user_id is None else ' WHERE user_id = ?'
+        parameters = (limit,) if user_id is None else (user_id, limit)
+        cursor.execute(f'''
             SELECT query, keyword_count, result_count, duration_ms, search_type, timestamp
             FROM search_log
+            {user_filter}
             ORDER BY created_at DESC
             LIMIT ?
-        ''', (limit,))
+        ''', parameters)
         
         return [
             {
@@ -174,40 +196,52 @@ class PerformanceTracker:
             for row in cursor.fetchall()
         ]
     
-    def get_average_search_time(self) -> Optional[float]:
-        """Get average search time across all searches."""
+    def get_average_search_time(self, user_id: Optional[int] = None) -> Optional[float]:
+        """Get average search time globally or for one user."""
         db = self.db_getter()
         cursor = db.cursor()
-        cursor.execute('SELECT AVG(duration_ms) FROM search_log')
+        if user_id is None:
+            cursor.execute('SELECT AVG(duration_ms) FROM search_log')
+        else:
+            cursor.execute(
+                'SELECT AVG(duration_ms) FROM search_log WHERE user_id = ?',
+                (user_id,),
+            )
         result = cursor.fetchone()
         return result[0] if result and result[0] else None
     
-    def get_performance_summary(self) -> dict:
+    def get_performance_summary(self, user_id: Optional[int] = None) -> dict:
         """Get overall performance summary."""
         db = self.db_getter()
         cursor = db.cursor()
         
         # Encryption stats
-        cursor.execute('''
+        user_filter = '' if user_id is None else ' AND user_id = ?'
+        parameters = () if user_id is None else (user_id,)
+        cursor.execute(f'''
             SELECT COUNT(*), AVG(duration_ms), MIN(duration_ms), MAX(duration_ms)
             FROM performance_log
             WHERE operation = 'encryption'
-        ''')
+            {user_filter}
+        ''', parameters)
         enc_result = cursor.fetchone()
         
         # Search stats
-        cursor.execute('''
+        search_filter = '' if user_id is None else ' WHERE user_id = ?'
+        cursor.execute(f'''
             SELECT COUNT(*), AVG(duration_ms)
             FROM search_log
-        ''')
+            {search_filter}
+        ''', parameters)
         search_result = cursor.fetchone()
         
         # CUBE update stats
-        cursor.execute('''
+        cursor.execute(f'''
             SELECT COUNT(*), AVG(duration_ms)
             FROM performance_log
             WHERE operation = 'cube_index_update'
-        ''')
+            {user_filter}
+        ''', parameters)
         cube_result = cursor.fetchone()
         
         return {

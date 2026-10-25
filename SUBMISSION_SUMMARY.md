@@ -2,6 +2,14 @@
 
 ## Project Summary
 
+> **Current status correction:** Review 3 implements key/index integrity detection,
+> versioned key rotation, CUBE reconstruction, and recovery. Those controls do not
+> prove formal forward/backward privacy. Phase 3A adds optional offline semantic
+> expansion before token generation. Phase 3B adds signed Merkle membership proofs for
+> result integrity/authenticity, but does not prove completeness;
+> historical completion and test-count statements below
+> are superseded by current validation.
+
 This submission delivers a complete implementation of **Forward and Backward Private Conjunctive Dynamic Searchable Symmetric Encryption (DSSE)** for an AI-based medical records system.
 
 ### Key Achievement

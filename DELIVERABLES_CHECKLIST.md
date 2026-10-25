@@ -2,6 +2,14 @@
 
 ## 📦 Complete Submission Package
 
+> **Current status correction:** Review 3 adds authenticated key/index state checks,
+> versioned search-key rotation, CUBE reconstruction, and recovery. This does not prove
+> formal forward/backward privacy. Phase 3A adds optional offline semantic expansion
+> before token generation. Phase 3B adds signed Merkle membership proofs for result
+> integrity/authenticity, but does not prove completeness; historical
+> completion and test-count claims are superseded by
+> current validation.
+
 ### Status: ✅ ALL ITEMS DELIVERED AND VERIFIED
 
 ---

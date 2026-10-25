@@ -1,5 +1,13 @@
 # Quick Start Guide - Review 2
 
+> **Current status correction:** Review 3 adds key/index integrity detection, versioned
+> key rotation, CUBE reconstruction, and recovery. It does not prove formal
+> forward/backward privacy. Phase 3A adds optional offline semantic query expansion.
+> Phase 3B adds opt-in signed Merkle membership proofs for result integrity, but does
+> not prove result completeness.
+> Historical privacy, readiness, and test-count claims below are superseded by current
+> test runs.
+
 ## Installation
 
 ```bash
@@ -22,17 +30,28 @@ Server will start at: `http://127.0.0.1:5000`
 ## Running Tests
 
 ```bash
-# Run comprehensive Review-2 test suite
+# Run the security, recovery, and semantic-search suites
+python -m unittest -v test_phase1_security test_phase2_recovery test_phase3a_semantic
+# Run existing Review-2 and threading regressions
 python test_review2.py
+python test_threading_fix.py
 ```
 
-Expected output:
+The legacy Review-2 script reports:
 ```
 Total Tests:  10
 Passed:       10
 Failed:       0
 Success Rate: 100.0%
 ```
+
+### Optional Semantic Search
+
+On the Search page, turn on **Enable Semantic Search** for a natural-language query.
+For example, `high blood sugar treatment` can expand to related terms including
+`diabetes`, `glucose`, `hyperglycemia`, and `insulin`. Expanded terms are searched as
+alternatives. Explicit `AND` queries remain conjunctive and are not semantically
+expanded. Leaving the option off uses the existing exact-search behavior.
 
 ## Demo Scenario (10 minutes)
 

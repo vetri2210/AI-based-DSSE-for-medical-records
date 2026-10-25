@@ -1,5 +1,13 @@
 # Review 2 - Quick Reference Card for Judges
 
+> **Current status correction:** Review 3 adds authenticated key/index-state checks,
+> versioned search-key rotation, CUBE reconstruction, and recovery. These controls do
+> not establish formal forward/backward privacy. Phase 3A adds optional local semantic
+> expansion before token generation. Phase 3B adds opt-in signed Merkle membership
+> proofs for result integrity/authenticity, but does not prove completeness;
+> historical readiness and test-count claims below are superseded by
+> current validation.
+
 ## ⚡ 60-Second Summary
 
 **What:** Searchable Symmetric Encryption for medical records

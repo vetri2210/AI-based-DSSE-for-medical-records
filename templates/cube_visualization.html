@@ -72,8 +72,8 @@
         <div class="alert alert-light border">
           <h6 class="mb-2">🔢 LCIC (Logical Counter Index Chain)</h6>
           <p class="mb-0 small">
-            Maintains counter values for each keyword token. Supports forward privacy by 
-            preventing linking of updates to previous search operations.
+            Stores an update counter for each keyword token. The current search flow does
+            not use these counters to establish a formal privacy guarantee.
           </p>
           <div class="mt-2 small">
             <strong>Entries:</strong> {{ cube_stats.get('lcic_entries', 0) }}
@@ -98,8 +98,8 @@
         <div class="alert alert-light border">
           <h6 class="mb-2">⛓️ VKIC (Vertical Keyword Index Chain)</h6>
           <p class="mb-0 small">
-            Maintains version chains for keyword-document pairs. Supports backward privacy 
-            by ensuring deleted documents cannot be recovered through stale index states.
+            Stores version and state records for keyword-document pairs. Active search
+            results are read from HKI; VKIC is not a search-verification mechanism.
           </p>
           <div class="mt-2 small">
             <strong>Entries:</strong> {{ cube_stats.get('vkic_entries', 0) }}
@@ -162,9 +162,8 @@
 {% endif %}
 
 <div class="alert alert-warning mt-4">
-  <strong>⚠️ Privacy Notice:</strong>
-  The CUBE index uses cryptographic tokens (not plaintext keywords) as searchable identifiers.
-  Keyword tokens displayed here are HMAC-derived and do not reveal the original keywords.
-  This protects against keyword exposure while enabling secure search.
+  <strong>Implementation note:</strong>
+  The displayed identifiers are HMAC-derived tokens. This implementation does not
+  establish forward privacy, backward privacy, or verifiable search.
 </div>
 {% endblock %}

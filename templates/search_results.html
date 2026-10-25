@@ -19,8 +19,10 @@
           <div class="h5 mb-0">
             {% if search_type == 'conjunctive' %}
               <span class="badge bg-primary">Conjunctive AND</span>
+            {% elif search_type == 'semantic' %}
+              <span class="badge bg-info">Semantic (OR)</span>
             {% else %}
-              <span class="badge bg-secondary">Single Keyword</span>
+              <span class="badge bg-secondary">Exact Search</span>
             {% endif %}
           </div>
         </div>
@@ -47,6 +49,39 @@
         {% endfor %}
       </div>
     </div>
+
+    {% if semantic_enabled and semantic_used %}
+    <div class="mb-3">
+      <h5>Semantic expansion</h5>
+      <div class="d-flex flex-wrap gap-2">
+        {% for term in expanded_terms %}
+          <span class="badge bg-info">{{ term }}</span>
+        {% endfor %}
+      </div>
+      <small class="text-muted">
+        Expanded terms are searched as alternatives. Explicit AND queries keep
+        their original conjunctive behavior.
+      </small>
+    </div>
+    {% elif semantic_enabled %}
+    <div class="alert alert-secondary">
+      Semantic expansion was not applied; exact search was used.
+    </div>
+    {% endif %}
+
+    {% if verification_requested %}
+    <div class="alert alert-info" id="verification-status" role="status" aria-live="polite">
+      {% if verification_bundle %}
+        Verifying result authenticity...
+      {% else %}
+        Verification data is unavailable.
+      {% endif %}
+    </div>
+    <small class="text-muted d-block mb-2">
+      Membership verification confirms that a result is in the signed index.
+      It does not establish search completeness or detect omitted matches.
+    </small>
+    {% endif %}
   </div>
 </div>
 
@@ -90,4 +125,99 @@
     {% endif %}
   </div>
 </div>
+{% if verification_requested and verification_bundle %}
+<script id="verification-bundle" type="application/json">{{ verification_bundle|tojson }}</script>
+<script>
+(() => {
+  const status = document.getElementById("verification-status");
+  const bundle = JSON.parse(document.getElementById("verification-bundle").textContent);
+  const expectedUserId = {{ verification_expected_user_id|tojson }};
+  const resultIds = {{ results|map(attribute="id")|list|tojson }};
+
+  const fromHex = (hex) => {
+    if (typeof hex !== "string" || !/^(?:[0-9a-f]{2})+$/i.test(hex)) {
+      throw new Error("Malformed hexadecimal value");
+    }
+    return Uint8Array.from(hex.match(/.{2}/g), (byte) => parseInt(byte, 16));
+  };
+  const concatenate = (...arrays) => {
+    const output = new Uint8Array(arrays.reduce((total, item) => total + item.length, 0));
+    let offset = 0;
+    for (const item of arrays) {
+      output.set(item, offset);
+      offset += item.length;
+    }
+    return output;
+  };
+  const digest = async (bytes) =>
+    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const bytesToHex = (bytes) =>
+    Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+  async function verifyProof(proof) {
+    const leaf = proof.leaf;
+    if (
+      !Array.isArray(leaf) || leaf.length !== 4 ||
+      !Number.isSafeInteger(leaf[0]) || typeof leaf[1] !== "string" ||
+      !Number.isSafeInteger(leaf[2]) || !Number.isSafeInteger(leaf[3]) ||
+      leaf[1] !== leaf[1].trim().toLowerCase() ||
+      proof.result_id !== leaf[2] || leaf[3] !== bundle.key_version ||
+      (expectedUserId !== null && leaf[0] !== expectedUserId)
+    ) return false;
+
+    let current = await digest(concatenate(
+      new Uint8Array([0]), new TextEncoder().encode(JSON.stringify(leaf))
+    ));
+    if (!Array.isArray(proof.siblings)) return false;
+    for (const sibling of proof.siblings) {
+      if (!sibling || !["left", "right"].includes(sibling.side)) return false;
+      const siblingHash = fromHex(sibling.hash);
+      if (siblingHash.length !== 32) return false;
+      current = sibling.side === "left"
+        ? await digest(concatenate(new Uint8Array([1]), siblingHash, current))
+        : await digest(concatenate(new Uint8Array([1]), current, siblingHash));
+    }
+    return bytesToHex(current) === bundle.root;
+  }
+
+  async function verifyAll() {
+    if (!resultIds.length) {
+      status.textContent = "No result membership proofs are available; completeness is not verified.";
+      status.className = "alert alert-secondary";
+      return;
+    }
+    const proofs = bundle.proofs;
+    if (!Array.isArray(proofs) || !proofs.length) throw new Error("Missing proofs");
+    const publicKey = await crypto.subtle.importKey(
+      "raw", fromHex(bundle.public_key), { name: "Ed25519" }, false, ["verify"]
+    );
+    const signedPayload = concatenate(
+      new TextEncoder().encode("search-result-manifest-v1:"),
+      new TextEncoder().encode(JSON.stringify([
+        bundle.user_scope, bundle.key_version, bundle.leaf_count, bundle.root
+      ]))
+    );
+    const signatureValid = await crypto.subtle.verify(
+      "Ed25519", publicKey, fromHex(bundle.root_signature), signedPayload
+    );
+    if (!signatureValid) throw new Error("Root signature verification failed");
+    const verifiedResults = new Set();
+    for (const proof of proofs) {
+      if (!await verifyProof(proof)) throw new Error("Membership proof verification failed");
+      verifiedResults.add(proof.result_id);
+    }
+    if (resultIds.some((id) => !verifiedResults.has(id))) {
+      throw new Error("A result has no valid membership proof");
+    }
+    status.textContent = "VERIFIED — returned result membership and authenticity confirmed. Completeness is not verified.";
+    status.className = "alert alert-success";
+  }
+
+  verifyAll().catch(() => {
+    status.textContent = "VERIFICATION FAILED — result authenticity could not be confirmed.";
+    status.className = "alert alert-danger";
+  });
+})();
+</script>
+{% endif %}
 {% endblock %}

@@ -8,7 +8,7 @@ Tests for:
 - Conjunctive search
 - Dynamic insertion
 - Dynamic deletion
-- Backward privacy
+- Removal from active search results after deletion
 - Performance measurement
 - API endpoints
 """
@@ -252,8 +252,8 @@ class TestRunner:
             return False
     
     def test_dynamic_deletion(self):
-        """Test 6: Dynamic document deletion and backward privacy."""
-        print("TEST 6: Dynamic Document Deletion (Backward Privacy)")
+        """Test 6: Dynamic document deletion from active search results."""
+        print("TEST 6: Dynamic Document Deletion (Active Search Results)")
         print("-" * 70)
         
         try:
@@ -269,14 +269,17 @@ class TestRunner:
             # Verify document is NOT searchable after deletion
             results_after = self.cube_index.search_single_keyword('kidney')
             assert doc_id3 not in results_after, \
-                "Document should NOT be searchable after deletion (backward privacy)"
+                "Document should not be searchable after deletion"
             
             # Verify other documents still work
             results = self.cube_index.search_single_keyword('diabetes')
             assert doc_id3 not in results, "Deleted document should not appear"
             assert 1 in results, "Other documents should still be searchable"
             
-            self.result("PASS", "Dynamic deletion and backward privacy enforced")
+            self.result(
+                "PASS",
+                "Dynamic deletion removes the document from active search results",
+            )
             return True
         except Exception as e:
             self.result("FAIL", f"Dynamic deletion failed: {str(e)}")

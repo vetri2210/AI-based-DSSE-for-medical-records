@@ -308,6 +308,49 @@ class PhaseTwoRecoveryTests(unittest.TestCase):
                     ],
                 )
 
+    def test_security_recovery_route_refreshes_metadata_and_rejects_old_tokens(self):
+        with app.app_context():
+            document_id = self.add_document(self.owner, "record.txt", ["diabetes", "renal"])
+            old_version = self.get_state()["key_version"]
+            old_key = application_module.SEARCH_KEY
+            old_index = application_module.CUBEIndex(get_db, old_key, key_version=old_version)
+            with self.client.session_transaction() as browser_session:
+                browser_session.update(user_id=self.owner, username="owner", role="admin")
+
+            response = self.client.post("/admin/security/recover")
+            self.assertEqual(response.status_code, 302)
+            state = self.get_state()
+            self.assertEqual(state["previous_key_version"], old_version)
+            self.assertEqual(state["previous_key_status"], "ACTIVE")
+            self.assertEqual(state["recovery_status"], "COMPLETED")
+            self.assertEqual(state["key_version"], old_version + 1)
+            self.assertEqual(old_index.search_single_keyword("diabetes"), [])
+            self.assertEqual(
+                application_module.cube_index.search_single_keyword("diabetes"),
+                [document_id],
+            )
+            self.assertIn(b"Trigger Security Recovery", self.client.get("/admin/key-status").data)
+
+    def test_old_key_version_is_rejected_at_api_search(self):
+        with app.app_context():
+            self.add_document(self.owner, "record.txt", ["diabetes"])
+            old_version = self.get_state()["key_version"]
+            application_module.rotate_search_key()
+            self.assertEqual(self.get_state()["key_version"], old_version + 1)
+        with self.client.session_transaction() as browser_session:
+            browser_session.update(user_id=self.owner, username="owner", role="student")
+
+        response = self.client.post(
+            "/api/search",
+            json={"query": "diabetes", "key_version": old_version},
+        )
+        self.assertEqual(response.status_code, 401)
+        accepted = self.client.post(
+            "/api/search",
+            json={"query": "diabetes", "key_version": old_version + 1},
+        )
+        self.assertEqual(accepted.status_code, 200)
+
     def test_secret_material_is_not_exposed_in_ui_or_api(self):
         with app.app_context():
             self.add_document(self.owner, "record.txt", ["diabetes"])

@@ -1,6 +1,6 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2 class="mb-4">Search-Key and CUBE Recovery</h2>
+<h2 class="mb-4">Security Recovery</h2>
 
 {% if state %}
 <div class="card mb-4">
@@ -8,8 +8,18 @@
     <dl class="row mb-3">
       <dt class="col-sm-4">Current key version</dt>
       <dd class="col-sm-8">{{ state.key_version }}</dd>
+      <dt class="col-sm-4">Previous key version</dt>
+      <dd class="col-sm-8">{{ state.previous_key_version or "Not recorded" }}</dd>
+      <dt class="col-sm-4">Previous version status</dt>
+      <dd class="col-sm-8">{{ state.previous_key_status or "Not recorded" }}</dd>
+      <dt class="col-sm-4">Recovery status</dt>
+      <dd class="col-sm-8">{{ state.recovery_status or "NOT_STARTED" }}</dd>
       <dt class="col-sm-4">Key/index status</dt>
       <dd class="col-sm-8">{{ state.key_status }}</dd>
+      <dt class="col-sm-4">Documents re-encrypted</dt>
+      <dd class="col-sm-8">{{ state.documents_reencrypted or 0 }}</dd>
+      <dt class="col-sm-4">Verification refresh</dt>
+      <dd class="col-sm-8">{{ state.verification_refresh_status or "NOT_STARTED" }}</dd>
       <dt class="col-sm-4">Last rotation</dt>
       <dd class="col-sm-8">{{ state.last_rotation_at or "Not recorded" }}</dd>
       <dt class="col-sm-4">Last recovery</dt>
@@ -20,8 +30,8 @@
         {% if state.last_reconstruction_at %} — {{ state.last_reconstruction_at }}{% endif %}
       </dd>
     </dl>
-    <form method="post" action="{{ url_for('admin_recover_search_index') }}">
-      <button class="btn btn-primary" type="submit">Rotate Key and Rebuild CUBE</button>
+    <form method="post" action="{{ url_for('trigger_security_recovery') }}">
+      <button class="btn btn-primary" type="submit">Trigger Security Recovery</button>
     </form>
   </div>
 </div>

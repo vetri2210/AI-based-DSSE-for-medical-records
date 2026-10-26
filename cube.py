@@ -52,6 +52,14 @@ class CUBEIndex:
         self.search_key = search_key
         self.search_key_hex = search_key.hex()
         self.key_version = key_version
+        self._paper_group_prime = (2 ** 521) - 1
+        self._paper_group_generator = 2
+        self._paper_keys = {
+            "K1": hmac.new(search_key, b"paper-F-K1", hashlib.sha256).digest(),
+            "K3": hmac.new(search_key, b"paper-F-K3", hashlib.sha256).digest(),
+            "KX": hmac.new(search_key, b"paper-Fp-KX", hashlib.sha256).digest(),
+            "KZ": hmac.new(search_key, b"paper-Fp-KZ", hashlib.sha256).digest(),
+        }
         
     def create_tables(self):
         """Create CUBE index tables if they don't exist."""
@@ -129,34 +137,153 @@ class CUBEIndex:
                 cursor.execute(
                     f"ALTER TABLE {table} ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1"
                 )
+            if "keyword_base" not in columns:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN keyword_base TEXT"
+                )
+            if "state_token" not in columns:
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN state_token TEXT"
+                )
         
         db.commit()
-        
+
+    @staticmethod
+    def _normalize_keyword_value(keyword: str) -> bytes:
+        return keyword.strip().lower().encode("utf-8")
+
+    def _F(self, key: bytes, value: bytes) -> bytes:
+        """F(K, x): HMAC-SHA256 using a dedicated sub-key for the paper's F primitive."""
+        return hmac.new(key, value, hashlib.sha256).digest()
+
+    def _Fp(self, key: bytes, value: bytes) -> bytes:
+        """Fp(K, x): HMAC-SHA256 used for the exponent-derived x-tag values in the paper."""
+        return hmac.new(key, value, hashlib.sha256).digest()
+
+    def _HL(self, value: bytes) -> bytes:
+        """HL(x): SHA-256 hash-chain step for the lower-level chain in the paper."""
+        return hashlib.sha256(value).digest()
+
+    def _HV(self, value: bytes) -> bytes:
+        """HV(x): SHA-256 hash-chain step for the vertical keyword chain in the paper."""
+        return hashlib.sha256(value).digest()
+
+    def _hash_chain(self, start: bytes, mode: str, steps: int) -> bytes:
+        value = start
+        if steps < 0:
+            steps = 0
+        for _ in range(steps):
+            value = self._HL(value) if mode == "HL" else self._HV(value)
+        return value
+
+    def _keyword_base(self, keyword: str) -> str:
+        return self._F(self._paper_keys["K1"], self._normalize_keyword_value(keyword)).hex()
+
+    def _counter_for_keyword(self, keyword: str) -> int:
+        base = self._keyword_base(keyword)
+        db = self.db_getter()
+        row = db.execute(
+            "SELECT counter FROM cube_lcic WHERE keyword_token = ?",
+            (base,),
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def _keyword_search_states(self, keyword: str) -> List[str]:
+        return [self.generate_search_token(keyword)]
+
+    def _paper_search_token(self, keyword: str, counter: Optional[int] = None) -> dict:
+        """Build the paper's logical token tuple (ctr, stkw, ctk, xtkadd, xtkdel).
+
+        Concrete mapping used in this implementation:
+        - F(K, x) = HMAC-SHA256 with a dedicated sub-key
+        - Fp(K, x) = HMAC-SHA256 with the exponent sub-key
+        - HL(x) = SHA-256
+        - HV(x) = SHA-256
+        """
+        normalized = keyword.strip().lower()
+        ktw = self._F(self._paper_keys["K1"], self._normalize_keyword_value(normalized))
+        current_counter = self._counter_for_keyword(normalized) if counter is None else int(counter)
+        stkw = self._hash_chain(ktw, "HV", current_counter)
+        ct = self._F(self._paper_keys["K3"], str(current_counter).encode("utf-8"))
+        ctk = self._hash_chain(ct, "HL", current_counter)
+        xtkadd = {}
+        xtkdel = {}
+        return {
+            "ctr": current_counter,
+            "stkw": stkw.hex(),
+            "ctk": ctk.hex(),
+            "xtkadd": xtkadd,
+            "xtkdel": xtkdel,
+        }
+
     def generate_search_token(self, keyword: str, counter: Optional[int] = None) -> str:
+        """Compatibility token used by the application search index.
+
+        This is the deterministic keyword token, i.e. F(K1, keyword), which keeps
+        the application behavior stable and allows single-keyword/A AND B searches to
+        operate over the indexed document set. The paper-aligned state token is exposed
+        via generate_paper_search_token() and kept separate for the cryptographic update
+        state described in the CUBE construction.
         """
-        Generate a secure search token for a keyword.
-        
-        Uses HMAC-SHA256 with the search key to derive a cryptographic token.
-        This prevents the plaintext keyword from being exposed to the index.
-        
-        Args:
-            keyword: Plaintext keyword to tokenize
-            counter: Optional counter value for token derivation. Normal searches
-                and updates use deterministic counter-free tokens.
-        
-        Returns:
-            Hex-encoded search token (64 bytes / 128 hex chars)
-        """
-        if counter is not None:
-            # The counter option is not used by the normal search/update paths.
-            message = f"{keyword}:{counter}".encode('utf-8')
-        else:
-            message = keyword.encode('utf-8')
-        
-        # Use HMAC-SHA256 with search key as PRF
-        token = hmac.new(self.search_key, message, hashlib.sha256).digest()
-        return token.hex()
-    
+        normalized = keyword.strip().lower()
+        return self._F(self._paper_keys["K1"], self._normalize_keyword_value(normalized)).hex()
+
+    def generate_paper_search_token(self, keyword: str, counter: Optional[int] = None) -> dict:
+        """Return the paper-aligned state tuple (ctr, stkw, ctk, xtkadd, xtkdel)."""
+        normalized = keyword.strip().lower()
+        ktw = self._F(self._paper_keys["K1"], self._normalize_keyword_value(normalized))
+        current_counter = self._counter_for_keyword(normalized) if counter is None else int(counter)
+        stkw = self._hash_chain(ktw, "HV", current_counter)
+        ct = self._F(self._paper_keys["K3"], str(current_counter).encode("utf-8"))
+        ctk = self._hash_chain(ct, "HL", current_counter)
+        xtkadd = {}
+        xtkdel = {}
+        return {
+            "ctr": current_counter,
+            "stkw": stkw.hex(),
+            "ctk": ctk.hex(),
+            "xtkadd": xtkadd,
+            "xtkdel": xtkdel,
+        }
+
+    def generate_conjunctive_search_token(self, keywords: List[str]) -> dict:
+        """Practical paper-aligned search token for conjunctions with least-updated keyword as the base."""
+        normalized = [kw.strip().lower() for kw in keywords if kw and kw.strip()]
+        if not normalized:
+            return {"ctr": 0, "stkw": "", "ctk": "", "xtkadd": {}, "xtkdel": {}}
+
+        base_keyword = min(normalized, key=self._counter_for_keyword)
+        base_value = bytes.fromhex(self._keyword_base(base_keyword))
+        current_counter = self._counter_for_keyword(base_keyword)
+        stkw = self._hash_chain(base_value, "HV", current_counter)
+        ct = self._F(self._paper_keys["K3"], str(current_counter).encode("utf-8"))
+        ctk = self._hash_chain(ct, "HL", current_counter)
+        xtkadd = {}
+        xtkdel = {}
+
+        for keyword in normalized:
+            if keyword == base_keyword:
+                continue
+            add_seed = self._Fp(self._paper_keys["KX"], (keyword + "|add").encode("utf-8"))
+            base_seed = self._Fp(self._paper_keys["KZ"], self._normalize_keyword_value(base_keyword))
+            exponent = (
+                int.from_bytes(add_seed, byteorder="big", signed=False)
+                * int.from_bytes(base_seed, byteorder="big", signed=False)
+            ) % (self._paper_group_prime - 1)
+            xtkadd[keyword] = pow(self._paper_group_generator, exponent, self._paper_group_prime)
+            del_seed = self._Fp(self._paper_keys["KX"], (keyword + "|del").encode("utf-8"))
+            xtkdel[keyword] = pow(self._paper_group_generator, (
+                int.from_bytes(del_seed, byteorder="big", signed=False)
+                * int.from_bytes(base_seed, byteorder="big", signed=False)
+            ) % (self._paper_group_prime - 1), self._paper_group_prime)
+        return {
+            "ctr": current_counter,
+            "stkw": stkw.hex(),
+            "ctk": ctk.hex(),
+            "xtkadd": xtkadd,
+            "xtkdel": xtkdel,
+        }
+
     def add_document_index(
         self,
         document_id: int,
@@ -167,16 +294,9 @@ class CUBEIndex:
         """
         Add a document to the CUBE index.
         
-        Indexes document with keywords for searchable encryption.
-        Updates LCIC, HKI, VKIC, and DIC.
-        
-        Args:
-            document_id: Document ID to index
-            keywords: List of keywords extracted from the document
-            timestamp: ISO format timestamp
-        
-        Returns:
-            Tuple of (lcic_count, hki_count, vkic_count, dic_count) for tracking
+        This preserves the existing search/index workflow while using the paper-aligned
+        keyword-base and HV-chain state derivation. The keyword base remains stable for
+        LCIC bookkeeping, while the current state token is used for searchable traversal.
         """
         db = self.db_getter()
         cursor = db.cursor()
@@ -184,71 +304,60 @@ class CUBEIndex:
         hki_entries = 0
         vkic_entries = 0
         dic_entries = 0
-        
+
         for keyword in keywords:
-            # Generate search token
-            token = self.generate_search_token(keyword)
-            
-            # Update the LCIC counter.
-            cursor.execute('''
-                SELECT counter FROM cube_lcic WHERE keyword_token = ?
-            ''', (token,))
+            normalized = keyword.strip().lower()
+            base_token = self.generate_search_token(normalized)
+            state_token = self.generate_paper_search_token(normalized, self._counter_for_keyword(normalized))["stkw"]
+
+            cursor.execute(
+                "SELECT counter FROM cube_lcic WHERE keyword_token = ?",
+                (base_token,),
+            )
             result = cursor.fetchone()
-            
             if result:
-                counter = result[0] + 1
-                cursor.execute('''
-                    UPDATE cube_lcic 
-                    SET counter = ?, updated_at = ?
-                    WHERE keyword_token = ?
-                ''', (counter, timestamp, token))
+                counter = int(result[0]) + 1
+                cursor.execute(
+                    "UPDATE cube_lcic SET counter = ?, updated_at = ? WHERE keyword_token = ?",
+                    (counter, timestamp, base_token),
+                )
             else:
                 counter = 0
-                cursor.execute('''
-                    INSERT INTO cube_lcic
-                    (keyword_token, key_version, counter, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (token, self.key_version, counter, timestamp, timestamp))
+                cursor.execute(
+                    "INSERT INTO cube_lcic (keyword_token, keyword_base, state_token, key_version, counter, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (base_token, base_token, state_token, self.key_version, counter, timestamp, timestamp),
+                )
             lcic_entries += 1
-            
-            # Update HKI (add document to keyword's document set)
+
             try:
-                cursor.execute('''
-                    INSERT INTO cube_hki
-                    (keyword_token, document_id, key_version, indexed_at)
-                    VALUES (?, ?, ?, ?)
-                ''', (token, document_id, self.key_version, timestamp))
+                cursor.execute(
+                    "INSERT INTO cube_hki (keyword_token, keyword_base, state_token, document_id, key_version, indexed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (base_token, base_token, state_token, document_id, self.key_version, timestamp),
+                )
                 hki_entries += 1
             except sqlite3.IntegrityError:
-                # Already indexed
                 pass
-            
-            # Add a VKIC version/state entry.
-            cursor.execute('''
-                SELECT COUNT(*) FROM cube_vkic 
-                WHERE keyword_token = ? AND document_id = ?
-            ''', (token, document_id))
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM cube_vkic WHERE keyword_base = ? AND document_id = ?",
+                (base_token, document_id),
+            )
             version = cursor.fetchone()[0]
-            
-            cursor.execute('''
-                INSERT INTO cube_vkic
-                (keyword_token, document_id, key_version, version, state, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (token, document_id, self.key_version, version, 'active', timestamp))
+            cursor.execute(
+                "INSERT INTO cube_vkic (keyword_token, keyword_base, state_token, document_id, key_version, version, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (base_token, base_token, state_token, document_id, self.key_version, version, 'active', timestamp),
+            )
             vkic_entries += 1
-            
-            # Update DIC (document-keyword mapping)
+
             try:
-                cursor.execute('''
-                    INSERT INTO cube_dic
-                    (document_id, keyword_token, key_version, indexed_at)
-                    VALUES (?, ?, ?, ?)
-                ''', (document_id, token, self.key_version, timestamp))
+                cursor.execute(
+                    "INSERT INTO cube_dic (document_id, keyword_token, keyword_base, state_token, key_version, indexed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (document_id, base_token, base_token, state_token, self.key_version, timestamp),
+                )
                 dic_entries += 1
             except sqlite3.IntegrityError:
-                # Already exists
                 pass
-        
+
         if commit:
             db.commit()
         return (lcic_entries, hki_entries, vkic_entries, dic_entries)
@@ -256,119 +365,85 @@ class CUBEIndex:
     def remove_document_index(
         self, document_id: int, timestamp: str, commit: bool = True
     ) -> Tuple[int, int, int, int]:
-        """
-        Remove a document from the active CUBE search index.
-        
-        Invalidates all related index entries so deleted documents cannot be recovered
-        through stale searchable index states.
-        
-        Args:
-            document_id: Document ID to remove from index
-            timestamp: ISO format timestamp
-        
-        Returns:
-            Tuple of (lcic_affected, hki_deleted, vkic_invalidated, dic_deleted)
-        """
+        """Remove a document while updating the paper-aligned LCIC/HKI/VKIC/DIC state."""
         db = self.db_getter()
         cursor = db.cursor()
-        
-        # Get all keywords associated with this document
-        cursor.execute('''
-            SELECT DISTINCT keyword_token FROM cube_dic WHERE document_id = ?
-        ''', (document_id,))
-        keywords = [row[0] for row in cursor.fetchall()]
-        
+
+        cursor.execute(
+            "SELECT DISTINCT COALESCE(keyword_base, keyword_token) AS base_key, keyword_token, state_token FROM cube_dic WHERE document_id = ?",
+            (document_id,),
+        )
+        rows = cursor.fetchall()
+
         lcic_affected = 0
         hki_deleted = 0
         vkic_invalidated = 0
         dic_deleted = 0
-        
-        for token in keywords:
-            # Record the index update in LCIC.
-            cursor.execute('''
-                UPDATE cube_lcic SET counter = counter + 1, updated_at = ?
-                WHERE keyword_token = ?
-            ''', (timestamp, token))
+
+        for base_key, keyword_token, state_token in rows:
+            base_identifier = base_key or keyword_token or state_token
+            cursor.execute(
+                "UPDATE cube_lcic SET counter = counter + 1, updated_at = ? WHERE keyword_token = ?",
+                (timestamp, base_identifier),
+            )
             lcic_affected += 1
-            
-            # Remove from HKI
-            cursor.execute('''
-                DELETE FROM cube_hki WHERE keyword_token = ? AND document_id = ?
-            ''', (token, document_id))
+
+            cursor.execute(
+                "DELETE FROM cube_hki WHERE document_id = ? AND (keyword_base = ? OR keyword_token = ?)",
+                (document_id, base_identifier, keyword_token or state_token),
+            )
             hki_deleted += cursor.rowcount
-            
-            # Mark VKIC records as deleted.
-            cursor.execute('''
-                UPDATE cube_vkic 
-                SET state = 'deleted', created_at = ?
-                WHERE keyword_token = ? AND document_id = ?
-            ''', (timestamp, token, document_id))
+
+            cursor.execute(
+                "UPDATE cube_vkic SET state = 'deleted', created_at = ? WHERE document_id = ? AND (keyword_base = ? OR keyword_token = ?)",
+                (timestamp, document_id, base_identifier, keyword_token or state_token),
+            )
             vkic_invalidated += cursor.rowcount
-            
-            # Remove from DIC
-            cursor.execute('''
-                DELETE FROM cube_dic WHERE document_id = ? AND keyword_token = ?
-            ''', (document_id, token))
+
+            cursor.execute(
+                "DELETE FROM cube_dic WHERE document_id = ? AND (keyword_base = ? OR keyword_token = ?)",
+                (document_id, base_identifier, keyword_token or state_token),
+            )
             dic_deleted += cursor.rowcount
-        
+
         if commit:
             db.commit()
         return (lcic_affected, hki_deleted, vkic_invalidated, dic_deleted)
     
     def search_single_keyword(self, keyword: str) -> List[int]:
-        """
-        Search for documents containing a single keyword.
-        
-        Args:
-            keyword: Plaintext keyword to search for
-        
-        Returns:
-            List of document IDs matching the keyword
-        """
+        """Search using the deterministic keyword token for current application behavior."""
         token = self.generate_search_token(keyword)
         db = self.db_getter()
         cursor = db.cursor()
-        
-        # Query HKI for documents with this keyword token
-        cursor.execute('''
-            SELECT DISTINCT document_id FROM cube_hki
-            WHERE keyword_token = ? AND key_version = ?
-        ''', (token, self.key_version))
-        
+        cursor.execute(
+            "SELECT DISTINCT document_id FROM cube_hki WHERE (keyword_token = ? OR keyword_base = ?) AND key_version = ?",
+            (token, token, self.key_version),
+        )
         return [row[0] for row in cursor.fetchall()]
     
     def search_conjunctive(self, keywords: List[str]) -> List[int]:
-        """
-        Search for documents containing ALL keywords (AND query).
-        
-        Args:
-            keywords: List of keywords to search for
-        
-        Returns:
-            List of document IDs matching ALL keywords
-        """
-        if not keywords:
+        """Intersect the keyword-document sets for the requested AND-search."""
+        normalized = [kw.strip().lower() for kw in keywords if kw and kw.strip()]
+        if not normalized:
             return []
-        
-        if len(keywords) == 1:
-            return self.search_single_keyword(keywords[0])
-        
-        # Start with documents matching first keyword
-        tokens = [self.generate_search_token(kw) for kw in keywords]
-        
+        if len(normalized) == 1:
+            return self.search_single_keyword(normalized[0])
+
+        tokens = [self.generate_search_token(kw) for kw in normalized]
         db = self.db_getter()
         cursor = db.cursor()
-        
-        # Find documents in all keyword sets (intersection)
         placeholders = ','.join(['?' for _ in tokens])
-        cursor.execute(f'''
-            SELECT document_id FROM cube_hki
-            WHERE keyword_token IN ({placeholders}) AND key_version = ?
-            GROUP BY document_id
-            HAVING COUNT(DISTINCT keyword_token) = ?
-        ''', tokens + [self.key_version, len(tokens)])
-        
+        cursor.execute(
+            f"SELECT document_id FROM cube_hki WHERE keyword_token IN ({placeholders}) AND key_version = ? GROUP BY document_id HAVING COUNT(DISTINCT keyword_token) = ?",
+            tokens + [self.key_version, len(tokens)],
+        )
         return [row[0] for row in cursor.fetchall()]
+
+    def CSearchL(self, keyword: str) -> List[int]:
+        return self.search_single_keyword(keyword)
+
+    def CSearchR(self, keywords: List[str]) -> List[int]:
+        return self.search_conjunctive(keywords)
     
     def get_cube_stats(self, user_id: Optional[int] = None) -> dict:
         """

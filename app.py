@@ -349,6 +349,65 @@ def _set_lifecycle_status(db, status: str, key: bytes) -> None:
     _write_state_mac(db, key)
 
 
+def reencrypt_documents_for_recovery(new_key: bytes) -> int:
+    """Re-encrypt document payloads with the new active AES material after a rotation."""
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT id, encrypted_path, aes_key, filename
+        FROM documents
+        WHERE encrypted_path IS NOT NULL AND aes_key IS NOT NULL
+        ORDER BY id
+        """
+    ).fetchall()
+    reencrypted = 0
+    for row in rows:
+        encrypted_path = row["encrypted_path"]
+        if not encrypted_path or not os.path.isfile(encrypted_path):
+            continue
+        with open(encrypted_path, "rb") as encrypted_file:
+            ciphertext = encrypted_file.read()
+        try:
+            plaintext = decrypt_bytes(ciphertext, row["aes_key"])
+        except (ValueError, TypeError):
+            raise SearchIndexRecoveryError(
+                f"Could not decrypt document {row['id']} during recovery"
+            )
+        new_key_b64 = base64.b64encode(new_key).decode("utf-8")
+        rotated_path = os.path.join(
+            app.config["ENCRYPTED_FOLDER"],
+            f"doc-{row['id']}-{uuid4().hex}.enc",
+        )
+        cipher = AES.new(new_key, AES.MODE_GCM)
+        encrypted_payload, tag = cipher.encrypt_and_digest(plaintext)
+        with open(rotated_path, "wb") as rotated_file:
+            rotated_file.write(cipher.nonce)
+            rotated_file.write(tag)
+            rotated_file.write(encrypted_payload)
+        db.execute(
+            "UPDATE documents SET encrypted_path = ?, aes_key = ? WHERE id = ?",
+            (rotated_path, new_key_b64, row["id"]),
+        )
+        if encrypted_path != rotated_path:
+            try:
+                os.remove(encrypted_path)
+            except OSError:
+                app.logger.exception(
+                    "Could not remove a legacy encrypted document during recovery"
+                )
+        reencrypted += 1
+    db.execute(
+        "UPDATE cube_config SET documents_reencrypted = ? WHERE id = 1",
+        (reencrypted,),
+    )
+    return reencrypted
+
+
+def rotate_security_keys(recovery: bool = False, force: bool = False) -> int:
+    """Compatibility wrapper for the prototype's explicit security recovery action."""
+    return rotate_search_key(recovery=recovery, force=force)
+
+
 def rotate_search_key(recovery: bool = False, force: bool = False) -> int:
     """Rotate the search key and atomically replace all four CUBE structures."""
     global SEARCH_KEY, cube_index
@@ -409,6 +468,7 @@ def rotate_search_key(recovery: bool = False, force: bool = False) -> int:
                 db, "RECOVERY" if recovery else "ROTATION", "STARTED",
                 old_version, new_version,
             )
+            reencrypted_count = reencrypt_documents_for_recovery(new_key)
             key_path = _store_versioned_key(new_version, new_key)
             candidate = CUBEIndex(get_db, new_key, key_version=new_version)
             for table in ("cube_hki", "cube_vkic", "cube_dic", "cube_lcic"):
@@ -438,8 +498,13 @@ def rotate_search_key(recovery: bool = False, force: bool = False) -> int:
             db.execute(
                 """
                 UPDATE cube_config
-                SET key_version = ?, key_status = 'ACTIVE',
+                SET previous_key_version = ?, previous_key_status = ?,
+                    key_version = ?, key_status = 'ACTIVE',
                     search_key_hash = ?, index_mac = ?,
+                    recovery_status = 'COMPLETED',
+                    recovery_timestamp = CASE WHEN ? THEN ? ELSE recovery_timestamp END,
+                    verification_refresh_status = 'REFRESHED',
+                    documents_reencrypted = ?,
                     last_rotation_at = ?,
                     last_recovery_at = CASE WHEN ? THEN ? ELSE last_recovery_at END,
                     last_reconstruction_status = 'SUCCESS',
@@ -447,9 +512,14 @@ def rotate_search_key(recovery: bool = False, force: bool = False) -> int:
                 WHERE id = 1
                 """,
                 (
+                    old_version,
+                    config["key_status"] if config else "ACTIVE",
                     new_version,
                     hashlib.sha256(new_key).hexdigest(),
                     index_mac,
+                    int(recovery),
+                    now,
+                    reencrypted_count,
                     now,
                     int(recovery),
                     now,
@@ -500,12 +570,19 @@ def rotate_search_key(recovery: bool = False, force: bool = False) -> int:
                 db.execute(
                     """
                     UPDATE cube_config
-                    SET key_status = 'COMPROMISED',
+                    SET previous_key_version = ?, previous_key_status = ?,
+                        recovery_status = 'FAILED',
+                        verification_refresh_status = 'FAILED',
+                        key_status = 'COMPROMISED',
                         last_reconstruction_status = 'FAILED',
                         last_reconstruction_at = ?
                     WHERE id = 1
                     """,
-                    (_utc_now_iso(),),
+                    (
+                        config["key_version"] if config and config["key_version"] is not None else old_version,
+                        (config["key_status"] if config else "ACTIVE"),
+                        _utc_now_iso(),
+                    ),
                 )
                 _write_state_mac(db, old_key)
                 _record_lifecycle_event(
@@ -787,6 +864,12 @@ def create_tables():
     lifecycle_columns = {
         "key_version": "INTEGER NOT NULL DEFAULT 1",
         "key_status": "TEXT NOT NULL DEFAULT 'ACTIVE'",
+        "previous_key_version": "INTEGER",
+        "previous_key_status": "TEXT",
+        "recovery_status": "TEXT NOT NULL DEFAULT 'NOT_STARTED'",
+        "recovery_timestamp": "TEXT",
+        "documents_reencrypted": "INTEGER NOT NULL DEFAULT 0",
+        "verification_refresh_status": "TEXT NOT NULL DEFAULT 'NOT_STARTED'",
         "index_mac": "TEXT",
         "state_mac": "TEXT",
         "last_rotation_at": "TEXT",
@@ -848,17 +931,27 @@ def create_tables():
             """
             INSERT INTO cube_config
             (id, search_key_hash, created_at, key_version, key_status,
-             index_mac, state_mac, last_rotation_at, last_recovery_at,
+             previous_key_version, previous_key_status, recovery_status,
+             recovery_timestamp, documents_reencrypted,
+             verification_refresh_status, index_mac, state_mac,
+             last_rotation_at, last_recovery_at,
              last_reconstruction_status, last_reconstruction_at)
-            VALUES (1, ?, ?, 1, 'ACTIVE', '', '', NULL, NULL, 'SUCCESS', ?)
+            VALUES (1, ?, ?, 1, 'ACTIVE', NULL, NULL, 'COMPLETED', ?, 0,
+                    'REFRESHED', '', '', NULL, NULL, 'SUCCESS', ?)
             ON CONFLICT(id) DO UPDATE SET
                 search_key_hash = excluded.search_key_hash,
                 key_version = 1,
                 key_status = 'ACTIVE',
+                previous_key_version = excluded.previous_key_version,
+                previous_key_status = excluded.previous_key_status,
+                recovery_status = excluded.recovery_status,
+                recovery_timestamp = excluded.recovery_timestamp,
+                documents_reencrypted = excluded.documents_reencrypted,
+                verification_refresh_status = excluded.verification_refresh_status,
                 last_reconstruction_status = 'SUCCESS',
                 last_reconstruction_at = excluded.last_reconstruction_at
             """,
-            (current_key_hash, now, now),
+            (current_key_hash, now, now, now),
         )
         db.commit()
         if not os.path.isfile(key_path):
@@ -1591,6 +1684,18 @@ def api_search():
     
     if not query or not cube_index:
         return jsonify({'error': 'Invalid query or search unavailable'}), 400
+
+    requested_key_version = data.get("key_version")
+    if requested_key_version is not None:
+        try:
+            requested_key_version = int(requested_key_version)
+        except (TypeError, ValueError):
+            return jsonify({"error": "key_version must be an integer"}), 400
+        current_key_version = get_db().execute(
+            "SELECT key_version FROM cube_config WHERE id = 1"
+        ).fetchone()
+        if not current_key_version or requested_key_version != current_key_version["key_version"]:
+            return jsonify({"error": "Search credentials from a revoked key version were rejected."}), 401
     
     # Parse keywords
     keywords = _parse_search_keywords(query)
@@ -1696,7 +1801,9 @@ def admin_key_status():
         flash("Recovery failed. The current index was not activated.", "danger")
     state = get_db().execute(
         """
-        SELECT key_version, key_status, last_rotation_at, last_recovery_at,
+        SELECT key_version, key_status, previous_key_version, previous_key_status,
+               recovery_status, recovery_timestamp, documents_reencrypted,
+               verification_refresh_status, last_rotation_at, last_recovery_at,
                last_reconstruction_status, last_reconstruction_at
         FROM cube_config WHERE id = 1
         """
@@ -1712,19 +1819,26 @@ def admin_key_status():
     )
 
 
-@app.route("/admin/key-status/recover", methods=["POST"])
+@app.route("/admin/security/recover", methods=["POST"])
 @admin_required
-def admin_recover_search_index():
+def trigger_security_recovery():
+    """Admin-only compromise trigger for the prototype recovery workflow."""
     try:
         new_version = rotate_search_key(recovery=True, force=True)
     except SearchIndexRecoveryError:
-        flash("Recovery failed. The current index was not activated.", "danger")
+        flash("Security recovery failed. The current index was not activated.", "danger")
     else:
         flash(
-            f"Search index recovered and key version advanced to {new_version}.",
+            f"Security recovery triggered. Key version advanced to {new_version}.",
             "success",
         )
     return redirect(url_for("admin_key_status"))
+
+
+@app.route("/admin/key-status/recover", methods=["POST"])
+@admin_required
+def admin_recover_search_index():
+    return trigger_security_recovery()
 
 
 @app.route("/performance")

@@ -1761,10 +1761,224 @@ def api_search():
     return jsonify(response_data)
 
 
+def _build_cube_visualization(user_id):
+    """Load safe, current-version CUBE rows and their real relational links."""
+    db = get_db()
+    version = cube_index.key_version
+    scope_sql = "" if user_id is None else " AND d.owner = ?"
+    scope_parameters = () if user_id is None else (user_id,)
+
+    hki_rows = db.execute(
+        """
+        SELECT h.id, h.keyword_token, h.document_id, d.filename
+        FROM cube_hki h
+        JOIN documents d ON d.id = h.document_id
+        WHERE h.key_version = ?""" + scope_sql + """
+        ORDER BY h.id
+        """,
+        (version, *scope_parameters),
+    ).fetchall()
+    vkic_rows = db.execute(
+        """
+        SELECT v.id, v.keyword_token, v.document_id, d.filename,
+               v.version, v.state
+        FROM cube_vkic v
+        JOIN documents d ON d.id = v.document_id
+        WHERE v.key_version = ?""" + scope_sql + """
+        ORDER BY v.id
+        """,
+        (version, *scope_parameters),
+    ).fetchall()
+    dic_rows = db.execute(
+        """
+        SELECT x.id, x.keyword_token, x.document_id, d.filename
+        FROM cube_dic x
+        JOIN documents d ON d.id = x.document_id
+        WHERE x.key_version = ?""" + scope_sql + """
+        ORDER BY x.id
+        """,
+        (version, *scope_parameters),
+    ).fetchall()
+
+    visible_tokens = {row["keyword_token"] for row in hki_rows}
+    lcic_rows = db.execute(
+        """
+        SELECT id, keyword_token, counter, updated_at
+        FROM cube_lcic
+        WHERE key_version = ?
+        ORDER BY id
+        """,
+        (version,),
+    ).fetchall()
+    lcic_rows = [
+        row for row in lcic_rows if row["keyword_token"] in visible_tokens
+    ]
+    visible_tokens.update(row["keyword_token"] for row in vkic_rows)
+    visible_tokens.update(row["keyword_token"] for row in dic_rows)
+
+    keyword_rows = db.execute(
+        """
+        SELECT d.id AS document_id, d.owner, k.keyword
+        FROM documents d
+        JOIN keywords k ON k.document_id = d.id
+        WHERE (? IS NULL OR d.owner = ?)
+        ORDER BY d.id, k.id
+        """,
+        (user_id, user_id),
+    ).fetchall()
+    keyword_by_token = {}
+    for row in keyword_rows:
+        token = cube_index.generate_search_token(row["keyword"])
+        if token in visible_tokens:
+            keyword_by_token.setdefault(token, row["keyword"])
+
+    query = request.args.get("query", "").strip()
+    query_terms = _parse_search_keywords(query) if query else []
+    matching_pairs = set()
+    matching_document_ids = set()
+    if query_terms:
+        matching_document_ids = set(
+            search_document_ids(query_terms, user_id=user_id)
+        )
+        matching_pairs = {
+            (term, document_id)
+            for term in query_terms
+            for document_id in cube_index.search_single_keyword(term)
+            if document_id in matching_document_ids
+        }
+
+    lcic = []
+    hki = []
+    vkic = []
+    dic = []
+    documents = {}
+    lcic_by_token = {}
+    hki_by_pair = {}
+    vkic_by_pair = {}
+    dic_by_pair = {}
+
+    for row in lcic_rows:
+        node_id = f"lcic-{row['id']}"
+        token = row["keyword_token"]
+        lcic_by_token[token] = node_id
+        lcic.append({
+            "id": node_id,
+            "keyword": keyword_by_token.get(token, "Keyword unavailable"),
+            "counter": row["counter"],
+            "updated_at": row["updated_at"],
+            "hki_ids": [],
+            "highlighted": False,
+        })
+
+    for row in hki_rows:
+        token = row["keyword_token"]
+        document_id = row["document_id"]
+        node_id = f"hki-{row['id']}"
+        pair = (token, document_id)
+        hki_by_pair.setdefault(pair, []).append(node_id)
+        documents[document_id] = row["filename"]
+        hki.append({
+            "id": node_id,
+            "keyword": keyword_by_token.get(token, "Keyword unavailable"),
+            "document_id": document_id,
+            "filename": row["filename"],
+            "lcic_id": lcic_by_token.get(token),
+            "vkic_ids": [],
+            "highlighted": (
+                (keyword_by_token.get(token, "").strip().lower(), document_id)
+                in matching_pairs
+            ),
+        })
+
+    for row in vkic_rows:
+        pair = (row["keyword_token"], row["document_id"])
+        node_id = f"vkic-{row['id']}"
+        vkic_by_pair.setdefault(pair, []).append(node_id)
+        vkic.append({
+            "id": node_id,
+            "keyword": keyword_by_token.get(
+                row["keyword_token"], "Keyword unavailable"
+            ),
+            "document_id": row["document_id"],
+            "filename": row["filename"],
+            "version": row["version"],
+            "state": row["state"],
+            "dic_ids": [],
+            "highlighted": (
+                (
+                    keyword_by_token.get(
+                        row["keyword_token"], ""
+                    ).strip().lower(),
+                    row["document_id"],
+                )
+                in matching_pairs
+            ),
+        })
+
+    for row in dic_rows:
+        pair = (row["keyword_token"], row["document_id"])
+        node_id = f"dic-{row['id']}"
+        dic_by_pair.setdefault(pair, []).append(node_id)
+        dic.append({
+            "id": node_id,
+            "keyword": keyword_by_token.get(
+                row["keyword_token"], "Keyword unavailable"
+            ),
+            "document_id": row["document_id"],
+            "filename": row["filename"],
+            "highlighted": (
+                (
+                    keyword_by_token.get(
+                        row["keyword_token"], ""
+                    ).strip().lower(),
+                    row["document_id"],
+                )
+                in matching_pairs
+            ),
+        })
+
+    for entry in hki:
+        token = next(
+            row["keyword_token"]
+            for row in hki_rows
+            if f"hki-{row['id']}" == entry["id"]
+        )
+        if entry["lcic_id"]:
+            lcic_node = next(node for node in lcic if node["id"] == entry["lcic_id"])
+            lcic_node["hki_ids"].append(entry["id"])
+            lcic_node["highlighted"] = (
+                lcic_node["highlighted"] or entry["highlighted"]
+            )
+        entry["vkic_ids"] = vkic_by_pair.get((token, entry["document_id"]), [])
+
+    for entry in vkic:
+        row = next(
+            row for row in vkic_rows if f"vkic-{row['id']}" == entry["id"]
+        )
+        entry["dic_ids"] = dic_by_pair.get(
+            (row["keyword_token"], entry["document_id"]), []
+        )
+
+    return {
+        "version": version,
+        "query": query,
+        "query_terms": query_terms,
+        "matching_document_ids": sorted(matching_document_ids),
+        "lcic": lcic,
+        "hki": hki,
+        "vkic": vkic,
+        "dic": dic,
+        "documents": [
+            {"id": document_id, "filename": filename}
+            for document_id, filename in sorted(documents.items())
+        ],
+    }
+
+
 @app.route("/cube-dashboard")
 @login_required
 def cube_dashboard():
-    """Visualize CUBE index structure and statistics."""
+    """Visualize current, authorized CUBE records without exposing token values."""
     global cube_index
 
     try:
@@ -1773,21 +1987,24 @@ def cube_dashboard():
         app.logger.exception("Search-index recovery failed before CUBE dashboard")
         flash("CUBE status is temporarily unavailable.", "danger")
         return redirect(url_for("dashboard"))
-    
-    if not cube_index:
-        cube_stats = {}
-        keyword_mappings = []
-    else:
-        user_id = None if session.get("role") == "admin" else session["user_id"]
-        cube_stats = cube_index.get_cube_stats(user_id=user_id)
-        keyword_mappings = cube_index.get_keyword_mappings(
-            limit=50, user_id=user_id
-        )
-    
+
+    user_id = None if session.get("role") == "admin" else session["user_id"]
+    cube_stats = cube_index.get_cube_stats(user_id=user_id) if cube_index else {}
+    cube_data = _build_cube_visualization(user_id) if cube_index else {
+        "version": None,
+        "query": "",
+        "query_terms": [],
+        "matching_document_ids": [],
+        "lcic": [],
+        "hki": [],
+        "vkic": [],
+        "dic": [],
+        "documents": [],
+    }
     return render_template(
         "cube_visualization.html",
         cube_stats=cube_stats,
-        keyword_mappings=keyword_mappings
+        cube_data=cube_data,
     )
 
 

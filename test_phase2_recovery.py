@@ -351,6 +351,52 @@ class PhaseTwoRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 200)
 
+    def test_cube_visualization_uses_live_authorized_rows_without_tokens(self):
+        with app.app_context():
+            document_id = self.add_document(
+                self.owner, "live-record.txt", ["diabetes", "renal"]
+            )
+            visible_token = application_module.cube_index.generate_search_token(
+                "diabetes"
+            ).encode()
+            self.add_document(
+                self.other_owner, "private-record.txt", ["diabetes"]
+            )
+            application_module.rotate_security_keys(recovery=True, force=True)
+        with self.client.session_transaction() as browser_session:
+            browser_session.update(
+                user_id=self.owner, username="owner", role="student"
+            )
+
+        response = self.client.get(
+            "/cube-dashboard", query_string={"query": "diabetes AND renal"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"live-record.txt", response.data)
+        self.assertNotIn(b"private-record.txt", response.data)
+        self.assertNotIn(visible_token, response.data)
+        self.assertIn(b"LCIC", response.data)
+        self.assertIn(b"HKI", response.data)
+        self.assertIn(b"VKIC", response.data)
+        self.assertIn(b"DIC", response.data)
+        self.assertIn(b"Matched documents: 1", response.data)
+        self.assertIn(b'cube-entry mb-2 highlighted', response.data)
+        self.assertIn(b"key version 2", response.data)
+
+        with app.app_context():
+            db = get_db()
+            application_module.cube_index.remove_document_index(
+                document_id, "2026-10-27", commit=False
+            )
+            db.execute("DELETE FROM keywords WHERE document_id = ?", (document_id,))
+            db.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            application_module._refresh_index_integrity(db)
+            db.commit()
+
+        after_delete = self.client.get("/cube-dashboard")
+        self.assertNotIn(b"live-record.txt", after_delete.data)
+
     def test_secret_material_is_not_exposed_in_ui_or_api(self):
         with app.app_context():
             self.add_document(self.owner, "record.txt", ["diabetes"])

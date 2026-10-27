@@ -1,169 +1,175 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2 class="mb-4">CUBE Index Visualization</h2>
+<h2 class="mb-3">Live CUBE Index Visualization</h2>
+<p class="text-muted">
+  Runtime view of the current database index (key version {{ cube_data.version }}).
+  Keyword and document labels come from authorized application records; cryptographic
+  token and key material is not displayed.
+</p>
 
 <div class="row g-3 mb-4">
   <div class="col-md-6">
-    <div class="card">
-      <div class="card-body text-center">
+    <div class="card"><div class="card-body text-center">
         <div class="text-muted">Total Documents</div>
         <div class="h3 mb-0">{{ cube_stats.get('total_documents', 0) }}</div>
-        <small class="text-muted">Encrypted in system</small>
-      </div>
-    </div>
+    </div></div>
   </div>
   <div class="col-md-6">
-    <div class="card">
-      <div class="card-body text-center">
-        <div class="text-muted">Indexed Documents</div>
-        <div class="h3 mb-0">{{ cube_stats.get('indexed_documents', 0) }}</div>
-        <small class="text-muted">In CUBE index</small>
-      </div>
-    </div>
+    <div class="card"><div class="card-body text-center">
+      <div class="text-muted">Indexed documents</div>
+      <div class="h3 mb-0">{{ cube_stats.get('indexed_documents', 0) }}</div>
+    </div></div>
   </div>
 </div>
 
-<div class="row g-3 mb-4">
-  <div class="col-md-3">
-    <div class="card border-primary">
-      <div class="card-body text-center">
-        <div class="text-muted small">LCIC Entries</div>
-        <div class="h4 mb-0 text-primary">{{ cube_stats.get('lcic_entries', 0) }}</div>
-        <small class="text-muted">Logical Counter Index</small>
-      </div>
-    </div>
+<form method="get" action="{{ url_for('cube_dashboard') }}" class="card card-body mb-4">
+  <label class="form-label" for="cube-query">Highlight a live CUBE search path</label>
+  <div class="input-group">
+    <input id="cube-query" class="form-control" type="text" name="query"
+           value="{{ cube_data.query }}" placeholder="keyword or keyword1 AND keyword2">
+    <button class="btn btn-primary" type="submit">Trace search path</button>
   </div>
-  <div class="col-md-3">
-    <div class="card border-success">
-      <div class="card-body text-center">
-        <div class="text-muted small">HKI Entries</div>
-        <div class="h4 mb-0 text-success">{{ cube_stats.get('hki_entries', 0) }}</div>
-        <small class="text-muted">Horizontal Keyword Index</small>
-      </div>
-    </div>
+  <small class="form-text text-muted">
+    Uses the active CUBE search and your current document access scope. Use AND for
+    conjunctive search. Matching keyword-to-document paths are highlighted below.
+  </small>
+  {% if cube_data.query and not cube_data.query_terms %}
+  <div class="alert alert-warning mt-3 mb-0">Enter one or more searchable keywords.</div>
+  {% elif cube_data.query_terms %}
+  <div class="mt-2 small">
+    Matched documents: {{ cube_data.matching_document_ids|length }}
   </div>
-  <div class="col-md-3">
-    <div class="card border-info">
-      <div class="card-body text-center">
-        <div class="text-muted small">VKIC Entries</div>
-        <div class="h4 mb-0 text-info">{{ cube_stats.get('vkic_entries', 0) }}</div>
-        <small class="text-muted">Vertical Keyword Index Chain</small>
-      </div>
-    </div>
-  </div>
-  <div class="col-md-3">
-    <div class="card border-warning">
-      <div class="card-body text-center">
-        <div class="text-muted small">DIC Entries</div>
-        <div class="h4 mb-0 text-warning">{{ cube_stats.get('dic_entries', 0) }}</div>
-        <small class="text-muted">Document Index Chain</small>
-      </div>
-    </div>
-  </div>
+  {% endif %}
+</form>
+
+<div class="alert alert-info">
+  <strong>How to read this view:</strong>
+  LCIC counters connect to HKI keyword/document entries; HKI entries connect to matching
+  VKIC state rows; VKIC rows connect to DIC document-keyword rows. Edges are derived
+  from actual current-version records and their keyword/document relationships.
 </div>
 
-<div class="card mb-4">
-  <div class="card-header">
-    <h5 class="mb-0">CUBE Components Architecture</h5>
-  </div>
-  <div class="card-body">
-    <div class="row g-3">
-      <div class="col-md-6">
-        <div class="alert alert-light border">
-          <h6 class="mb-2">🔢 LCIC (Logical Counter Index Chain)</h6>
-          <p class="mb-0 small">
-            Stores an update counter for each keyword token. The current search flow does
-            not use these counters to establish a formal privacy guarantee.
-          </p>
-          <div class="mt-2 small">
-            <strong>Entries:</strong> {{ cube_stats.get('lcic_entries', 0) }}
-          </div>
-        </div>
-      </div>
-      
-      <div class="col-md-6">
-        <div class="alert alert-light border">
-          <h6 class="mb-2">🎯 HKI (Horizontal Keyword Index)</h6>
-          <p class="mb-0 small">
-            Maps encrypted keyword tokens to sets of document IDs. Enables efficient 
-            search without decrypting documents.
-          </p>
-          <div class="mt-2 small">
-            <strong>Entries:</strong> {{ cube_stats.get('hki_entries', 0) }}
-          </div>
-        </div>
-      </div>
-      
-      <div class="col-md-6">
-        <div class="alert alert-light border">
-          <h6 class="mb-2">⛓️ VKIC (Vertical Keyword Index Chain)</h6>
-          <p class="mb-0 small">
-            Stores version and state records for keyword-document pairs. Active search
-            results are read from HKI; VKIC is not a search-verification mechanism.
-          </p>
-          <div class="mt-2 small">
-            <strong>Entries:</strong> {{ cube_stats.get('vkic_entries', 0) }}
-          </div>
-        </div>
-      </div>
-      
-      <div class="col-md-6">
-        <div class="alert alert-light border">
-          <h6 class="mb-2">📑 DIC (Document Index Chain)</h6>
-          <p class="mb-0 small">
-            Tracks which documents have been indexed with which keywords. Used for 
-            managing dynamic insertion and deletion operations.
-          </p>
-          <div class="mt-2 small">
-            <strong>Entries:</strong> {{ cube_stats.get('dic_entries', 0) }}
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
+<style>
+  .cube-entry { min-height: 100%; }
+  .cube-entry.highlighted {
+    border: 2px solid #dc3545 !important;
+    background-color: #fff3f3;
+    box-shadow: 0 0 0 .15rem rgba(220, 53, 69, .12);
+  }
+  .cube-layer { height: 100%; }
+  .cube-relations { overflow-wrap: anywhere; }
+</style>
 
-{% if keyword_mappings %}
-<div class="card">
-  <div class="card-header">
-    <h5 class="mb-0">Sample Keyword-Document Mappings (HKI)</h5>
-  </div>
-  <div class="table-responsive">
-    <table class="table table-hover mb-0">
-      <thead class="table-light">
-        <tr>
-          <th>Keyword Token (Encrypted)</th>
-          <th>Documents Indexed</th>
-          <th>Details</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for mapping in keyword_mappings %}
-          <tr>
-            <td>
-              <code class="text-break small">{{ mapping.token }}</code>
-              <small class="text-muted d-block">(full: {{ mapping.token_full[:32] }}...)</small>
-            </td>
-            <td>{{ mapping.doc_count }}</td>
-            <td>
-              <small class="text-muted">
-                This encrypted token maps to {{ mapping.doc_count }} document(s). 
-                The actual keyword remains encrypted.
-              </small>
-            </td>
-          </tr>
+<div class="row g-3">
+  <section class="col-xl-3 col-md-6" aria-labelledby="lcic-title">
+    <div class="card cube-layer">
+      <div class="card-header">
+        <h3 class="h5 mb-0" id="lcic-title">LCIC</h3>
+        <small>Logical Counter Index Chain · {{ cube_data.lcic|length }} records</small>
+      </div>
+      <div class="card-body">
+        {% for entry in cube_data.lcic %}
+        <article class="card cube-entry mb-2 {% if entry.highlighted %}highlighted{% endif %}">
+          <div class="card-body p-2">
+            <strong>{{ entry.keyword }}</strong>
+            <div class="small">Counter: {{ entry.counter }}</div>
+            <div class="small text-muted">Updated: {{ entry.updated_at }}</div>
+            <div class="cube-relations small mt-1">
+              → HKI:
+              {% for node_id in entry.hki_ids %}
+                <span class="badge text-bg-light">{{ node_id }}</span>
+              {% else %}none{% endfor %}
+            </div>
+          </div>
+        </article>
+        {% else %}
+        <p class="text-muted mb-0">No current LCIC records in this scope.</p>
         {% endfor %}
-      </tbody>
-    </table>
-  </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="col-xl-3 col-md-6" aria-labelledby="hki-title">
+    <div class="card cube-layer">
+      <div class="card-header">
+        <h3 class="h5 mb-0" id="hki-title">HKI</h3>
+        <small>Horizontal Keyword Index · {{ cube_data.hki|length }} records</small>
+      </div>
+      <div class="card-body">
+        {% for entry in cube_data.hki %}
+        <article class="card cube-entry mb-2 {% if entry.highlighted %}highlighted{% endif %}">
+          <div class="card-body p-2">
+            <strong>{{ entry.keyword }}</strong>
+            <div class="small">{{ entry.filename }} (document {{ entry.document_id }})</div>
+            <div class="cube-relations small mt-1">
+              LCIC: {{ entry.lcic_id or "none" }} · → VKIC:
+              {% for node_id in entry.vkic_ids %}
+                <span class="badge text-bg-light">{{ node_id }}</span>
+              {% else %}none{% endfor %}
+            </div>
+          </div>
+        </article>
+        {% else %}
+        <p class="text-muted mb-0">No current HKI records in this scope.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="col-xl-3 col-md-6" aria-labelledby="vkic-title">
+    <div class="card cube-layer">
+      <div class="card-header">
+        <h3 class="h5 mb-0" id="vkic-title">VKIC</h3>
+        <small>Vertical Keyword Index Chain · {{ cube_data.vkic|length }} records</small>
+      </div>
+      <div class="card-body">
+        {% for entry in cube_data.vkic %}
+        <article class="card cube-entry mb-2 {% if entry.highlighted %}highlighted{% endif %}">
+          <div class="card-body p-2">
+            <strong>{{ entry.keyword }}</strong>
+            <div class="small">{{ entry.filename }} (document {{ entry.document_id }})</div>
+            <div class="small">State: {{ entry.state }} · Version: {{ entry.version }}</div>
+            <div class="cube-relations small mt-1">
+              → DIC:
+              {% for node_id in entry.dic_ids %}
+                <span class="badge text-bg-light">{{ node_id }}</span>
+              {% else %}none{% endfor %}
+            </div>
+          </div>
+        </article>
+        {% else %}
+        <p class="text-muted mb-0">No current VKIC records in this scope.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section class="col-xl-3 col-md-6" aria-labelledby="dic-title">
+    <div class="card cube-layer">
+      <div class="card-header">
+        <h3 class="h5 mb-0" id="dic-title">DIC</h3>
+        <small>Document Index Chain · {{ cube_data.dic|length }} records</small>
+      </div>
+      <div class="card-body">
+        {% for entry in cube_data.dic %}
+        <article class="card cube-entry mb-2 {% if entry.highlighted %}highlighted{% endif %}">
+          <div class="card-body p-2">
+            <strong>{{ entry.keyword }}</strong>
+            <div class="small">{{ entry.filename }} (document {{ entry.document_id }})</div>
+            <div class="cube-relations small mt-1">Document node: doc-{{ entry.document_id }}</div>
+          </div>
+        </article>
+        {% else %}
+        <p class="text-muted mb-0">No current DIC records in this scope.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </section>
 </div>
-{% else %}
-<div class="alert alert-info">No keyword mappings to display yet. Upload documents to build the CUBE index.</div>
-{% endif %}
 
 <div class="alert alert-warning mt-4">
-  <strong>Implementation note:</strong>
-  The displayed identifiers are HMAC-derived tokens. This implementation does not
-  establish forward privacy, backward privacy, or verifiable search.
+  This is a live operational index view, not a cryptographic proof of search completeness
+  or formal forward/backward privacy. Document filenames and indexed keywords are shown
+  only within the current user's authorized scope.
 </div>
 {% endblock %}
